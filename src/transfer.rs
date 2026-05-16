@@ -26,8 +26,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicI64;
 use std::sync::mpsc;
+#[cfg(not(target_has_atomic = "64"))]
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use sha2::Digest;
@@ -165,7 +169,10 @@ pub struct TrzszTransfer {
     pub stop_and_delete: AtomicBool,
     pub term_reseted: AtomicBool,
     pub clean_timeout: Duration,
+    #[cfg(target_has_atomic = "64")]
     pub last_input_time: AtomicI64,
+    #[cfg(not(target_has_atomic = "64"))]
+    pub last_input_time: Mutex<i64>,
     pub last_chunk_time_arr: [Duration; K_LAST_CHUNK_TIME_COUNT],
     pub last_chunk_time_idx: AtomicU32,
     pub stdin_state: Option<()>,
@@ -188,7 +195,10 @@ impl TrzszTransfer {
             stop_and_delete: AtomicBool::new(false),
             term_reseted: AtomicBool::new(false),
             clean_timeout: Duration::from_millis(100),
+            #[cfg(target_has_atomic = "64")]
             last_input_time: AtomicI64::new(0),
+            #[cfg(not(target_has_atomic = "64"))]
+            last_input_time: Mutex::new(0),
             last_chunk_time_arr: [Duration::ZERO; K_LAST_CHUNK_TIME_COUNT],
             last_chunk_time_idx: AtomicU32::new(0),
             stdin_state: None,
@@ -215,13 +225,16 @@ impl TrzszTransfer {
 
     pub fn add_received_data(&self, buf: &[u8], _tunnel: bool) {
         self.buffer.add_buffer(buf);
-        self.last_input_time.store(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64,
-            Ordering::Relaxed,
-        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        #[cfg(target_has_atomic = "64")]
+        self.last_input_time.store(now, Ordering::Relaxed);
+        #[cfg(not(target_has_atomic = "64"))]
+        {
+            *self.last_input_time.lock().unwrap() = now;
+        }
     }
 
     pub fn stop_transferring_files(&self, stop_and_delete: bool) {
@@ -497,13 +510,21 @@ impl TrzszTransfer {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
+        #[cfg(target_has_atomic = "64")]
         self.last_input_time.store(start_ms, Ordering::SeqCst);
+        #[cfg(not(target_has_atomic = "64"))]
+        {
+            *self.last_input_time.lock().unwrap() = start_ms;
+        }
         loop {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as i64;
+            #[cfg(target_has_atomic = "64")]
             let last = self.last_input_time.load(Ordering::SeqCst);
+            #[cfg(not(target_has_atomic = "64"))]
+            let last = *self.last_input_time.lock().unwrap();
             let elapsed_since_last = now_ms - last;
             let remaining = timeout_duration.as_millis() as i64 - elapsed_since_last;
             if remaining <= 0 {
