@@ -58,7 +58,16 @@ pub fn trzsz_main(args: &TrzszArgs) -> i32 {
     }
 
     // Spawn a pty
+    #[cfg(feature = "pty")]
     let (pty_stdin, pty_stdout, mut child) = match spawn_pty(&args.args) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("spawn pty failed: {}\r\n", e);
+            return -1;
+        }
+    };
+    #[cfg(not(feature = "pty"))]
+    let (pty_stdin, pty_stdout, mut child) = match spawn_pty_fallback(&args.args) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("spawn pty failed: {}\r\n", e);
@@ -132,6 +141,7 @@ fn get_terminal_columns() -> i32 {
 }
 
 /// Spawn a pseudo-terminal and run the command.
+#[cfg(feature = "pty")]
 fn spawn_pty(args: &[String]) -> Result<(Box<dyn Write + Send>, Box<dyn Read + Send>, Box<dyn Child + Send>), TrzszError> {
     let cmd = &args[0];
     let cmd_args = &args[1..];
@@ -167,11 +177,41 @@ fn spawn_pty(args: &[String]) -> Result<(Box<dyn Write + Send>, Box<dyn Read + S
     Ok((Box::new(writer), Box::new(reader), Box::new(PtyChild { child, _pty_pair: pty_pair })))
 }
 
+/// Fallback when pty feature is disabled (no portable_pty support on this target).
+#[cfg(not(feature = "pty"))]
+fn spawn_pty_fallback(args: &[String]) -> Result<(Box<dyn Write + Send>, Box<dyn Read + Send>, Box<dyn Child + Send>), TrzszError> {
+    use std::process::Command;
+
+    let cmd = &args[0];
+    let cmd_args = &args[1..];
+
+    let mut child = Command::new(cmd)
+        .args(cmd_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .map_err(|e| {
+            comm::simple_trzsz_error("Spawn command failed", e)
+        })?;
+
+    let stdin = child.stdin.take().ok_or_else(|| {
+        comm::simple_trzsz_error("Take stdin failed", "No stdin")
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        comm::simple_trzsz_error("Take stdout failed", "No stdout")
+    })?;
+
+    Ok((Box::new(stdin), Box::new(stdout), Box::new(child)))
+}
+
+#[cfg(feature = "pty")]
 struct PtyChild {
     child: Box<dyn portable_pty::Child + Send>,
     _pty_pair: portable_pty::PtyPair,
 }
 
+#[cfg(feature = "pty")]
 impl Child for PtyChild {
     fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
         let status = self.child.wait().map_err(|e| {
@@ -197,6 +237,7 @@ trait Child {
     fn wait(&mut self) -> io::Result<std::process::ExitStatus>;
 }
 
+#[cfg(not(feature = "pty"))]
 impl Child for std::process::Child {
     fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
         std::process::Child::wait(self)

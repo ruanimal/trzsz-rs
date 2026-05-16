@@ -15,7 +15,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux musl targets
+          # Linux musl targets (with pty)
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             use_cross: false
@@ -41,40 +41,48 @@ jobs:
             use_cross: true
             use_upx: true
             archive: tar.gz
+          # Linux musl targets (without pty, portable_pty not supported)
           - target: s390x-unknown-linux-musl
             os: ubuntu-latest
             use_cross: true
             use_upx: true
+            no_default_features: true
             archive: tar.gz
           - target: powerpc64le-unknown-linux-musl
             os: ubuntu-latest
             use_cross: true
             use_upx: true
+            no_default_features: true
             archive: tar.gz
           - target: riscv64gc-unknown-linux-musl
             os: ubuntu-latest
             use_cross: true
             use_upx: true
+            no_default_features: true
             archive: tar.gz
           - target: mips-unknown-linux-musl
             os: ubuntu-latest
             use_cross: true
             use_upx: true
+            no_default_features: true
             archive: tar.gz
           - target: mipsel-unknown-linux-musl
             os: ubuntu-latest
             use_cross: true
             use_upx: true
+            no_default_features: true
             archive: tar.gz
           - target: mips64el-unknown-linux-muslabi64
             os: ubuntu-latest
             use_cross: true
             use_upx: true
+            no_default_features: true
             archive: tar.gz
           - target: mips64-unknown-linux-muslabi64
             os: ubuntu-latest
             use_cross: true
             use_upx: true
+            no_default_features: true
             archive: tar.gz
           # Linux glibc targets
           - target: x86_64-unknown-linux-gnu
@@ -116,8 +124,10 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+
+      - name: Install rust target
+        if: "!matrix.use_cross"
+        run: rustup target add ${{ matrix.target }}
 
       - name: Install musl-tools
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -138,11 +148,11 @@ jobs:
 
       - name: Build (cross)
         if: matrix.use_cross
-        run: cross build --release --locked --target ${{ matrix.target }}
+        run: cross build --release --locked --target ${{ matrix.target }} ${{ matrix.no_default_features && '--no-default-features' || '' }}
 
       - name: Build (cargo)
         if: "!matrix.use_cross"
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.no_default_features && '--no-default-features' || '' }}
 
       - name: Package (unix, original)
         if: matrix.archive == 'tar.gz'

@@ -31,9 +31,13 @@ md-5 = "0.10"
 unicode-width = "0.1"
 ctrlc = "3"
 
+[features]
+default = ["pty"]
+pty = ["dep:portable-pty"]
+
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["term", "process"] }
-portable-pty = "0.8"
+portable-pty = { version = "0.8", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
