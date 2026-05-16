@@ -111,7 +111,11 @@ pub fn trz_main(args: &TrzArgs) -> i32 {
         eprintln!("Binary upload on Windows is not supported, auto switch to base64 mode.");
     }
 
-    let unique_id = (chrono::Utc::now().timestamp_millis() % 10_000_000_000) * 100;
+    let unique_id = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+        % 10_000_000_000) * 100;
 
     let mode = if args.base.directory { "D" } else { "R" };
     let header = format!("\x1b[s::TRZSZ:TRANSFER:{}:{}:{:013}:0\r\n", mode, TRZSZ_VERSION, unique_id);

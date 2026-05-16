@@ -124,19 +124,19 @@ pub fn simple_error(format: &str) -> TrzszError {
     }
 }
 
-pub static ERR_STOPPED: once_cell::sync::Lazy<TrzszError> = once_cell::sync::Lazy::new(|| {
+pub static ERR_STOPPED: std::sync::LazyLock<TrzszError> = std::sync::LazyLock::new(|| {
     simple_error("Stopped")
 });
 
-pub static ERR_STOPPED_AND_DELETED: once_cell::sync::Lazy<TrzszError> = once_cell::sync::Lazy::new(|| {
+pub static ERR_STOPPED_AND_DELETED: std::sync::LazyLock<TrzszError> = std::sync::LazyLock::new(|| {
     simple_error("Stopped and deleted")
 });
 
-pub static ERR_RECEIVE_DATA_TIMEOUT: once_cell::sync::Lazy<TrzszError> = once_cell::sync::Lazy::new(|| {
+pub static ERR_RECEIVE_DATA_TIMEOUT: std::sync::LazyLock<TrzszError> = std::sync::LazyLock::new(|| {
     simple_error("Receive data timeout")
 });
 
-pub static ERR_INTERRUPTED: once_cell::sync::Lazy<TrzszError> = once_cell::sync::Lazy::new(|| {
+pub static ERR_INTERRUPTED: std::sync::LazyLock<TrzszError> = std::sync::LazyLock::new(|| {
     simple_error("Interrupted")
 });
 
@@ -553,11 +553,15 @@ pub struct BufferSize {
 
 impl BufferSize {
     pub fn parse(s: &str) -> Result<Self, TrzszError> {
-        let re = regex::Regex::new(r"(?i)^(\d+)(b|k|m|g|kb|mb|gb)?$").unwrap();
-        let caps = re.captures(s).ok_or_else(|| simple_trzsz_error("Invalid size", s))?;
-        let size_value = caps[1].parse::<i64>().map_err(|_| simple_trzsz_error("Invalid size", s))?;
-        let unit = caps.get(2).map(|m| m.as_str().to_lowercase()).unwrap_or_default();
-        let size = match unit.as_str() {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(simple_trzsz_error("Invalid size", s));
+        }
+        let (num_part, unit_part) = s.split_at(
+            s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()),
+        );
+        let size_value = num_part.parse::<i64>().map_err(|_| simple_trzsz_error("Invalid size", s))?;
+        let size = match unit_part.to_lowercase().as_str() {
             "" | "b" => size_value,
             "k" | "kb" => size_value * 1024,
             "m" | "mb" => size_value * 1024 * 1024,

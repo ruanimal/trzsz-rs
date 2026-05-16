@@ -108,7 +108,11 @@ pub fn tsz_main(args: &TszArgs) -> i32 {
         eprintln!("Binary download on Windows is not supported, auto switch to base64 mode.");
     }
 
-    let unique_id = (chrono::Utc::now().timestamp_millis() % 10_000_000_000) * 100;
+    let unique_id = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+        % 10_000_000_000) * 100;
 
     let header = format!("\x1b[s::TRZSZ:TRANSFER:S:{}:{:013}:0\r\n", TRZSZ_VERSION, unique_id);
     let _ = io::stdout().write_all(header.as_bytes());
