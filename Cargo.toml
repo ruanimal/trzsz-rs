@@ -1,7 +1,7 @@
 [package]
 name = "trzsz-rs"
 version = "1.2.0"
-edition = "2021"
+edition = "2024"
 description = "trzsz (trz / tsz) compatible with tmux, similar to lrzsz (rz / sz)."
 license = "MIT"
 readme = "README.md"

@@ -674,13 +674,13 @@ impl TrzszTransfer {
 
     pub fn send_files(&mut self, source_files: &[SourceFile], progress: &mut Option<&mut dyn ProgressCallback>) -> Result<Vec<String>, TrzszError> {
         self.send_file_num(source_files.len() as i64)?;
-        if let Some(ref mut p) = progress {
+        if let Some(p) = progress {
             p.on_num(source_files.len() as i64);
         }
         let mut remote_names = Vec::new();
         for src_file in source_files {
             let (file_opt, remote_name) = self.send_file_name(src_file)?;
-            if let Some(ref mut p) = progress {
+            if let Some(p) = progress {
                 p.on_name(src_file.get_file_name());
             }
             if !remote_names.contains(&remote_name) {
@@ -688,12 +688,12 @@ impl TrzszTransfer {
             }
             if let Some(mut file) = file_opt {
                 self.send_file_size(file.size())?;
-                if let Some(ref mut p) = progress {
+                if let Some(p) = progress {
                     p.on_size(file.size());
                 }
                 let digest = self.send_file_data(&mut *file)?;
                 self.send_file_md5(&digest)?;
-                if let Some(ref mut p) = progress {
+                if let Some(p) = progress {
                     p.on_done();
                 }
             }
@@ -757,13 +757,13 @@ impl TrzszTransfer {
 
     pub fn recv_files(&mut self, path: &Path, progress: &mut Option<&mut dyn ProgressCallback>) -> Result<Vec<String>, TrzszError> {
         let num = self.recv_file_num()?;
-        if let Some(ref mut p) = progress {
+        if let Some(p) = progress {
             p.on_num(num);
         }
         let mut local_names = Vec::new();
         for _ in 0..num {
             let (file_opt, local_name) = self.recv_file_name(path)?;
-            if let Some(ref mut p) = progress {
+            if let Some(p) = progress {
                 p.on_name(&local_name);
             }
             if !local_names.contains(&local_name) {
@@ -771,12 +771,12 @@ impl TrzszTransfer {
             }
             if let Some(mut file) = file_opt {
                 let size = self.recv_file_size()?;
-                if let Some(ref mut p) = progress {
+                if let Some(p) = progress {
                     p.on_size(size);
                 }
                 let digest = self.recv_file_data(&mut *file, size)?;
                 self.recv_file_md5(&digest)?;
-                if let Some(ref mut p) = progress {
+                if let Some(p) = progress {
                     p.on_done();
                 }
             }
