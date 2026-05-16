@@ -159,10 +159,7 @@ pub fn tsz_main(args: &TszArgs) -> i32 {
     let result = send_files(&mut transfer, &files, &args, tmux_mode, tmux_pane_width);
 
     match result {
-        Ok(msg) => {
-            transfer.server_exit(&msg);
-            0
-        }
+        Ok(_msg) => 0,
         Err(e) => {
             transfer.server_error(&e);
             0

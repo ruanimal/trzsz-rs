@@ -161,10 +161,7 @@ pub fn trz_main(args: &TrzArgs) -> i32 {
     let result = recv_files(&mut transfer, &args, tmux_mode, tmux_pane_width);
 
     match result {
-        Ok(msg) => {
-            transfer.server_exit(&msg);
-            0
-        }
+        Ok(_msg) => 0,
         Err(e) => {
             transfer.server_error(&e);
             0

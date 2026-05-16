@@ -489,12 +489,18 @@ pub fn format_saved_files(names: &[String], path: &Path) -> String {
         return "No file saved".to_string();
     }
     let count = names.len();
+    let plural = if count > 1 { "files/directories" } else { "file/directory" };
+    let mut result = format!("Saved {} {}", count, plural);
     let display_path = path.to_string_lossy();
-    if count == 1 {
-        format!("Saved {} into {}", names[0], display_path)
-    } else {
-        format!("Saved {} files into {}", count, display_path)
+    if !display_path.is_empty() {
+        result.push_str(" to ");
+        result.push_str(&display_path);
     }
+    for name in names {
+        result.push_str("\r\n- ");
+        result.push_str(name);
+    }
+    result
 }
 
 // ─── Join file names ───────────────────────────────────────────────────────
@@ -757,11 +763,11 @@ mod tests {
         assert_eq!(format_saved_files(&[], dir.path()), "No file saved");
         assert_eq!(
             format_saved_files(&["foo.txt".to_string()], dir.path()),
-            format!("Saved foo.txt into {}", dir.path().display())
+            format!("Saved 1 file/directory to {}\r\n- foo.txt", dir.path().display())
         );
         assert_eq!(
             format_saved_files(&["a.txt".to_string(), "b.txt".to_string()], dir.path()),
-            format!("Saved 2 files into {}", dir.path().display())
+            format!("Saved 2 files/directories to {}\r\n- a.txt\r\n- b.txt", dir.path().display())
         );
     }
 }
