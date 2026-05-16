@@ -23,7 +23,6 @@ SOFTWARE.
 */
 
 use std::io::{self, Read, Write};
-use std::path::Path;
 
 use crate::args::TrzszArgs;
 use crate::comm::{self, TrzszError};

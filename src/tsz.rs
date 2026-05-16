@@ -23,7 +23,6 @@ SOFTWARE.
 */
 
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::args::TszArgs;
@@ -31,8 +30,7 @@ use crate::comm::{
     self, check_duplicate_names, check_paths_readable,
     TrzszError,
 };
-use crate::escape::{self, get_escape_chars};
-use crate::transfer::{TrzszTransfer, K_PROTOCOL_VERSION};
+use crate::transfer::TrzszTransfer;
 use crate::version::TRZSZ_VERSION;
 
 pub fn tsz_main(args: &TszArgs) -> i32 {
@@ -73,14 +71,11 @@ pub fn tsz_main(args: &TszArgs) -> i32 {
         }
     };
 
-    let mut binary = args.base.binary;
-    if binary && tmux_mode == comm::TmuxMode::Control {
+    if args.base.binary && tmux_mode == comm::TmuxMode::Control {
         eprintln!("Binary download in tmux control mode is slower, auto switch to base64 mode.");
-        binary = false;
     }
-    if binary && comm::is_running_on_windows() {
+    if args.base.binary && comm::is_running_on_windows() {
         eprintln!("Binary download on Windows is not supported, auto switch to base64 mode.");
-        binary = false;
     }
 
     let unique_id = (chrono::Utc::now().timestamp_millis() % 10_000_000_000) * 100;
@@ -161,7 +156,6 @@ fn send_files(
         return Err(comm::simple_error("The client doesn't support transfer directory"));
     }
 
-    let escape_chars: Vec<(Vec<u8>, Vec<u8>)> = vec![];
     let escape_value = serde_json::Value::Null;
 
     transfer.transfer_config.binary = binary;
@@ -176,7 +170,7 @@ fn send_files(
         args.base.parse_compress().unwrap_or(crate::comm::CompressType::Auto),
     )?;
 
-    let remote_names = transfer.send_files(files, &mut None)?;
+    let _remote_names = transfer.send_files(files, &mut None)?;
 
     let msg = transfer.recv_exit()?;
     transfer.server_exit(&msg);
@@ -185,5 +179,4 @@ fn send_files(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 }

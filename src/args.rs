@@ -22,7 +22,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use std::path::PathBuf;
 
 use crate::comm::{BufferSize, CompressType};

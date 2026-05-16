@@ -22,14 +22,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-use std::io::{self, Read, Write};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::comm::{self, write_all, TrzszError};
 use crate::progress::TextProgressBar;
-use crate::transfer::{TrzszTransfer, TransferConfig};
+use crate::transfer::TrzszTransfer;
 use crate::version::TrzszVersion;
 
 /// TrzszOptions specify the options to create a TrzszFilter.
@@ -176,7 +174,7 @@ mod tests {
     #[test]
     fn test_detect_trzsz() {
         let output = b"some output::TRZSZ:TRANSFER:S:1.2.0:1234567890123:0\n";
-        let (buf, trigger) = TrzszFilter::detect_trzsz(output);
+        let (_buf, trigger) = TrzszFilter::detect_trzsz(output);
         assert!(trigger.is_some());
         let t = trigger.unwrap();
         assert_eq!(t.mode, 'S');
@@ -187,14 +185,14 @@ mod tests {
     #[test]
     fn test_detect_trzsz_no_trigger() {
         let output = b"just normal output\n";
-        let (buf, trigger) = TrzszFilter::detect_trzsz(output);
+        let (_buf, trigger) = TrzszFilter::detect_trzsz(output);
         assert!(trigger.is_none());
     }
 
     #[test]
     fn test_detect_trzsz_with_prefix() {
         let output = b"\x1b[s::TRZSZ:TRANSFER:R:1.0.0:0\n";
-        let (buf, trigger) = TrzszFilter::detect_trzsz(output);
+        let (_buf, trigger) = TrzszFilter::detect_trzsz(output);
         assert!(trigger.is_some());
         let t = trigger.unwrap();
         assert_eq!(t.mode, 'R');

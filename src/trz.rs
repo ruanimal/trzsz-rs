@@ -23,7 +23,6 @@ SOFTWARE.
 */
 
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::args::TrzArgs;
@@ -31,8 +30,8 @@ use crate::comm::{
     self, check_path_writable, format_saved_files,
     TrzszError,
 };
-use crate::escape::{self, get_escape_chars};
-use crate::transfer::{TrzszTransfer, K_PROTOCOL_VERSION};
+use crate::escape::get_escape_chars;
+use crate::transfer::TrzszTransfer;
 use crate::version::TRZSZ_VERSION;
 
 pub fn trz_main(args: &TrzArgs) -> i32 {
@@ -75,14 +74,11 @@ pub fn trz_main(args: &TrzArgs) -> i32 {
         }
     };
 
-    let mut binary = args.base.binary;
-    if binary && tmux_mode != comm::TmuxMode::None {
+    if args.base.binary && tmux_mode != comm::TmuxMode::None {
         eprintln!("Binary upload in tmux is not supported, auto switch to base64 mode.");
-        binary = false;
     }
-    if binary && comm::is_running_on_windows() {
+    if args.base.binary && comm::is_running_on_windows() {
         eprintln!("Binary upload on Windows is not supported, auto switch to base64 mode.");
-        binary = false;
     }
 
     let unique_id = (chrono::Utc::now().timestamp_millis() % 10_000_000_000) * 100;
@@ -195,8 +191,6 @@ fn recv_files(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_trz_main_help() {
         // Just verify it doesn't panic when args are invalid

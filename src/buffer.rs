@@ -22,16 +22,14 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-use std::io::{Read};
 use std::sync::mpsc::{self, SyncSender, Receiver};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::comm::{err_interrupted, err_receive_data_timeout, err_stopped, TrzszError};
 
 pub struct TrzszBuffer {
     sender: SyncSender<Vec<u8>>,
     receiver: Receiver<Vec<u8>>,
-    drain_receiver: Receiver<()>,
     next_buf: Option<Vec<u8>>,
     next_idx: usize,
     read_buf: Vec<u8>,
@@ -42,11 +40,9 @@ pub struct TrzszBuffer {
 impl TrzszBuffer {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::sync_channel(10000);
-        let (drain_tx, drain_rx) = mpsc::sync_channel(10000);
         TrzszBuffer {
             sender: tx,
             receiver: rx,
-            drain_receiver: drain_rx,
             next_buf: None,
             next_idx: 0,
             read_buf: Vec::new(),
@@ -69,16 +65,6 @@ impl TrzszBuffer {
 
     pub fn set_new_timeout(&mut self, timeout: Option<Instant>) {
         self.new_timeout = Some(timeout);
-    }
-
-    fn pop_buffer(&mut self) -> Option<&[u8]> {
-        let has_data = self.next_buf.as_ref().map_or(false, |buf| self.next_idx < buf.len());
-        if has_data {
-            return self.next_buf.as_deref().map(|buf| &buf[self.next_idx..]);
-        }
-        self.next_buf = None;
-        self.next_idx = 0;
-        None
     }
 
     pub fn next_buffer(&mut self) -> Result<Vec<u8>, TrzszError> {
@@ -197,14 +183,11 @@ impl TrzszBuffer {
             }
 
             let line_end = new_line_idx.unwrap_or(buf.len());
-            let remaining = if let Some(idx) = new_line_idx {
-                let mut rest = &buf[idx + 1..];
+            if new_line_idx.is_some() {
+                let rest = &buf[new_line_idx.unwrap() + 1..];
                 if !rest.is_empty() && rest[0] == b'\n' {
-                    rest = &rest[1..];
+                    // skip newline after '!'
                 }
-                Some(rest)
-            } else {
-                None
             };
 
             let data = &buf[..line_end];

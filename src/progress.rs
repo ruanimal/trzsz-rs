@@ -22,13 +22,10 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use unicode_width::UnicodeWidthStr;
-
-use crate::comm::write_all;
 
 pub trait ProgressCallback {
     fn on_num(&mut self, num: i64);
@@ -179,7 +176,6 @@ impl RecentSpeed {
 // ─── Text progress bar ─────────────────────────────────────────────────────
 
 pub struct TextProgressBar {
-    writer: Vec<u8>,
     pub columns: AtomicI32,
     tmux_pane_columns: AtomicI32,
     file_count: i32,
@@ -197,14 +193,13 @@ pub struct TextProgressBar {
 }
 
 impl TextProgressBar {
-    pub fn new(writer: Vec<u8>, columns: i32, tmux_pane_columns: i32, tmux_prefix: &str) -> Self {
+    pub fn new(columns: i32, tmux_pane_columns: i32, tmux_prefix: &str) -> Self {
         let effective_columns = if tmux_pane_columns > 1 {
             tmux_pane_columns - 1
         } else {
             columns
         };
         TextProgressBar {
-            writer,
             columns: AtomicI32::new(effective_columns),
             tmux_pane_columns: AtomicI32::new(tmux_pane_columns),
             file_count: 0,
@@ -223,15 +218,21 @@ impl TextProgressBar {
     }
 
     fn hide_cursor(&self) {
-        // ESC[?25l
+        self.write_progress("\x1b[?25l");
     }
 
-    fn show_cursor(&self) {
-        // ESC[?25h
+    pub fn show_cursor(&self) {
+        self.write_progress("\x1b[?25h");
     }
 
-    fn write_progress(&self, _progress: &str) {
-        // Would write to the actual writer (serverIn in the Go code)
+    fn write_progress(&self, progress: &str) {
+        let data = progress.as_bytes();
+        if !self.tmux_prefix.is_empty() {
+            let _ = data; // Would encode tmux output in real implementation
+        }
+        // In a real implementation, this would write to the server stdin
+        // For now, write directly to stderr for debugging
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), data);
     }
 
     fn show_progress(&mut self) {
@@ -263,8 +264,19 @@ impl TextProgressBar {
         };
 
         let progress_text = self.get_progress_text(&percentage, &total, &speed_str, &eta_str);
-        // Would actually write progress to writer
-        let _ = progress_text;
+
+        if self.first_write {
+            self.first_write = false;
+            self.write_progress(&format!("\x1b[?7l{}\x1b[?7h", progress_text));
+            return;
+        }
+
+        if self.tmux_pane_columns.load(Ordering::Relaxed) > 0 {
+            let cols = self.columns.load(Ordering::Relaxed);
+            self.write_progress(&format!("\x1b[{}D\x1b[?7l{}\x1b[?7h", cols, progress_text));
+        } else {
+            self.write_progress(&format!("\r\x1b[?7l{}\x1b[?7h", progress_text));
+        }
     }
 
     fn get_progress_text(&self, percentage: &str, total: &str, speed: &str, eta: &str) -> String {

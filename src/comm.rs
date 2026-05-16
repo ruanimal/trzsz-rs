@@ -140,8 +140,6 @@ pub static ERR_INTERRUPTED: once_cell::sync::Lazy<TrzszError> = once_cell::sync:
     simple_error("Interrupted")
 });
 
-use once_cell::sync::Lazy;
-
 pub fn err_stopped() -> TrzszError {
     simple_error("Stopped")
 }

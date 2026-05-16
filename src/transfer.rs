@@ -24,19 +24,18 @@ SOFTWARE.
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read, Write, BufRead, BufReader};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::io::Write;
+use std::path::Path;use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use sha2::{Sha256, Digest};
 
 use crate::buffer::TrzszBuffer;
 use crate::comm::{
-    self, BufferSize, CompressType, FileWriter, FileReader, SimpleFileReader, SimpleFileWriter,
-    SourceFile, TrzszError, write_all, err_stopped, err_receive_data_timeout,
-    get_new_name, format_saved_files,
+    CompressType, FileWriter, FileReader, SimpleFileReader, SimpleFileWriter,
+    SourceFile, TrzszError, err_stopped,
+    get_new_name, write_all,
 };
 use crate::escape::{self, EscapeTable};
 use crate::version::{TRZSZ_VERSION, TrzszVersion};
@@ -203,7 +202,7 @@ impl TrzszTransfer {
     }
 
     pub fn background(&self) -> mpsc::Receiver<()> {
-        self.bg_chan.clone(); // keep sender alive
+        let _ = self.bg_chan.clone(); // keep sender alive
         let (_, rx) = mpsc::sync_channel(1);
         rx
     }
@@ -256,7 +255,7 @@ impl TrzszTransfer {
         })
     }
 
-    pub fn recv_line(&mut self, expect_type: &str, may_has_junk: bool, timeout: Option<Instant>) -> Result<Vec<u8>, TrzszError> {
+    pub fn recv_line(&mut self, _expect_type: &str, may_has_junk: bool, timeout: Option<Instant>) -> Result<Vec<u8>, TrzszError> {
         self.check_stop()?;
         let line = self.buffer.read_line(may_has_junk, timeout)?;
         Ok(line)
