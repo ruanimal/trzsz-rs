@@ -77,7 +77,7 @@ jobs:
             os: ubuntu-latest
             build_tool: zigbuild
             no_default_features: true
-            use_upx: true
+            use_upx: false
             archive: tar.gz
           - target: powerpc64le-unknown-linux-musl
             os: ubuntu-latest
@@ -89,7 +89,7 @@ jobs:
             os: ubuntu-latest
             build_tool: zigbuild
             no_default_features: true
-            use_upx: true
+            use_upx: false
             archive: tar.gz
           # musl-cross + build-std (prebuilt musl GCC cross-compiler, no portable_pty)
           - target: mips-unknown-linux-musl
