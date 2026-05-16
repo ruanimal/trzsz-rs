@@ -1,0 +1,3 @@
+[submodule "trzsz-go"]
+	path = trzsz-go
+	url = https://github.com/trzsz/trzsz-go.git
