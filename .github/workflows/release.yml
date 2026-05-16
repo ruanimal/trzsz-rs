@@ -15,118 +15,122 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux musl targets (with pty)
+          # cargo build (native host compilation)
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            use_cross: false
+            build_tool: cargo
             use_upx: true
             archive: tar.gz
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
-            use_cross: true
-            use_upx: true
-            archive: tar.gz
-          - target: armv7-unknown-linux-musleabihf
-            os: ubuntu-latest
-            use_cross: true
-            use_upx: true
-            archive: tar.gz
-          - target: arm-unknown-linux-musleabihf
-            os: ubuntu-latest
-            use_cross: true
-            use_upx: true
-            archive: tar.gz
-          - target: i686-unknown-linux-musl
-            os: ubuntu-latest
-            use_cross: true
-            use_upx: true
-            archive: tar.gz
-          # Linux musl targets (without pty, portable_pty not supported)
-          - target: s390x-unknown-linux-musl
-            os: ubuntu-latest
-            use_cross: true
-            use_upx: true
-            no_default_features: true
-            archive: tar.gz
-          - target: powerpc64le-unknown-linux-musl
-            os: ubuntu-latest
-            use_cross: true
-            use_upx: true
-            no_default_features: true
-            archive: tar.gz
-          - target: riscv64gc-unknown-linux-musl
-            os: ubuntu-latest
-            use_cross: true
-            use_upx: true
-            no_default_features: true
-            archive: tar.gz
-          - target: mips-unknown-linux-musl
-            os: ubuntu-latest
-            use_cross: true
-            use_upx: true
-            no_default_features: true
-            archive: tar.gz
-          - target: mipsel-unknown-linux-musl
-            os: ubuntu-latest
-            use_cross: true
-            use_upx: true
-            no_default_features: true
-            archive: tar.gz
-          - target: mips64el-unknown-linux-muslabi64
-            os: ubuntu-latest
-            use_cross: true
-            use_upx: true
-            no_default_features: true
-            archive: tar.gz
-          - target: mips64-unknown-linux-muslabi64
-            os: ubuntu-latest
-            use_cross: true
-            use_upx: true
-            no_default_features: true
-            archive: tar.gz
-          # Linux glibc targets
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            use_cross: false
+            build_tool: cargo
             use_upx: true
             archive: tar.gz
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            use_cross: true
-            use_upx: true
-            archive: tar.gz
-          # macOS targets (UPX does not support macOS)
           - target: x86_64-apple-darwin
             os: macos-latest
-            use_cross: false
+            build_tool: cargo
             use_upx: false
             archive: tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
-            use_cross: false
+            build_tool: cargo
             use_upx: false
             archive: tar.gz
-          # Windows targets
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            use_cross: false
+            build_tool: cargo
             use_upx: true
             archive: zip
+          # cross (Docker-based cross-compilation)
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            build_tool: cross
+            use_upx: true
+            archive: tar.gz
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-latest
+            build_tool: cross
+            use_upx: true
+            archive: tar.gz
+          - target: arm-unknown-linux-musleabihf
+            os: ubuntu-latest
+            build_tool: cross
+            use_upx: true
+            archive: tar.gz
+          - target: i686-unknown-linux-musl
+            os: ubuntu-latest
+            build_tool: cross
+            use_upx: true
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            build_tool: cross
+            use_upx: true
+            archive: tar.gz
           - target: x86_64-pc-windows-gnu
             os: ubuntu-latest
-            use_cross: true
+            build_tool: cross
             use_upx: true
             archive: zip
+          # zigbuild + nightly (no cross Docker image, no prebuilt rust-std)
+          - target: s390x-unknown-linux-musl
+            os: ubuntu-latest
+            build_tool: zigbuild
+            no_default_features: true
+            use_upx: true
+            archive: tar.gz
+          - target: powerpc64le-unknown-linux-musl
+            os: ubuntu-latest
+            build_tool: zigbuild
+            no_default_features: true
+            use_upx: true
+            archive: tar.gz
+          - target: riscv64gc-unknown-linux-musl
+            os: ubuntu-latest
+            build_tool: zigbuild
+            no_default_features: true
+            use_upx: true
+            archive: tar.gz
+          - target: mips-unknown-linux-musl
+            os: ubuntu-latest
+            build_tool: zigbuild
+            no_default_features: true
+            use_upx: true
+            archive: tar.gz
+          - target: mipsel-unknown-linux-musl
+            os: ubuntu-latest
+            build_tool: zigbuild
+            no_default_features: true
+            use_upx: true
+            archive: tar.gz
+          - target: mips64el-unknown-linux-muslabi64
+            os: ubuntu-latest
+            build_tool: zigbuild
+            no_default_features: true
+            use_upx: true
+            archive: tar.gz
+          - target: mips64-unknown-linux-muslabi64
+            os: ubuntu-latest
+            build_tool: zigbuild
+            no_default_features: true
+            use_upx: true
+            archive: tar.gz
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Rust
+      - name: Setup Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup Rust nightly
+        if: matrix.build_tool == 'zigbuild'
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
       - name: Install rust target
-        if: "!matrix.use_cross"
+        if: matrix.build_tool == 'cargo'
         run: rustup target add ${{ matrix.target }}
 
       - name: Install musl-tools
@@ -143,16 +147,24 @@ jobs:
         run: choco install upx -y
 
       - name: Install cross
-        if: matrix.use_cross
+        if: matrix.build_tool == 'cross'
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build (cross)
-        if: matrix.use_cross
-        run: cross build --release --locked --target ${{ matrix.target }} ${{ matrix.no_default_features && '--no-default-features' || '' }}
+      - name: Install cargo-zigbuild
+        if: matrix.build_tool == 'zigbuild'
+        run: pip install ziglang && cargo install cargo-zigbuild
 
       - name: Build (cargo)
-        if: "!matrix.use_cross"
+        if: matrix.build_tool == 'cargo'
         run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.no_default_features && '--no-default-features' || '' }}
+
+      - name: Build (cross)
+        if: matrix.build_tool == 'cross'
+        run: cross build --release --locked --target ${{ matrix.target }} ${{ matrix.no_default_features && '--no-default-features' || '' }}
+
+      - name: Build (zigbuild)
+        if: matrix.build_tool == 'zigbuild'
+        run: cargo +nightly zigbuild --release --locked --target ${{ matrix.target }} -Zbuild-std=std,panic_abort ${{ matrix.no_default_features && '--no-default-features' || '' }}
 
       - name: Package (unix, original)
         if: matrix.archive == 'tar.gz'
