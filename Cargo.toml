@@ -1,6 +1,57 @@
 [package]
 name = "trzsz-rs"
-version = "0.1.0"
-edition = "2024"
+version = "1.2.0"
+edition = "2021"
+description = "trzsz (trz / tsz) compatible with tmux, similar to lrzsz (rz / sz)."
+license = "MIT"
+readme = "README.md"
+authors = ["trzsz contributors"]
+
+[[bin]]
+name = "trzsz"
+path = "src/bin/trzsz.rs"
+
+[[bin]]
+name = "trz"
+path = "src/bin/trz.rs"
+
+[[bin]]
+name = "tsz"
+path = "src/bin/tsz.rs"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+flate2 = "1"
+shell-words = "1"
+chrono = "0.4"
+libc = "0.2"
+sha2 = "0.10"
+indicatif = "0.17"
+unicode-width = "0.1"
+once_cell = "1"
+regex = "1"
+ctrlc = "3"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["term", "signal", "fs", "process", "ioctl"] }
+signal-hook = "0.3"
+portable-pty = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
+conpty = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
