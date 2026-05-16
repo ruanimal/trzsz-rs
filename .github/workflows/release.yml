@@ -1,0 +1,246 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux musl targets
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: false
+            use_upx: true
+            archive: tar.gz
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+            use_upx: true
+            archive: tar.gz
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-latest
+            use_cross: true
+            use_upx: true
+            archive: tar.gz
+          - target: arm-unknown-linux-musleabihf
+            os: ubuntu-latest
+            use_cross: true
+            use_upx: true
+            archive: tar.gz
+          - target: i686-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+            use_upx: true
+            archive: tar.gz
+          - target: s390x-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+            use_upx: true
+            archive: tar.gz
+          - target: powerpc64le-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+            use_upx: true
+            archive: tar.gz
+          - target: riscv64gc-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+            use_upx: true
+            archive: tar.gz
+          - target: mips-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+            use_upx: true
+            archive: tar.gz
+          - target: mipsel-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+            use_upx: true
+            archive: tar.gz
+          - target: mips64el-unknown-linux-muslabi64
+            os: ubuntu-latest
+            use_cross: true
+            use_upx: true
+            archive: tar.gz
+          - target: mips64-unknown-linux-muslabi64
+            os: ubuntu-latest
+            use_cross: true
+            use_upx: true
+            archive: tar.gz
+          # Linux glibc targets
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: false
+            use_upx: true
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+            use_upx: true
+            archive: tar.gz
+          # macOS targets (UPX does not support macOS)
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            use_cross: false
+            use_upx: false
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use_cross: false
+            use_upx: false
+            archive: tar.gz
+          # Windows targets
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
+            use_upx: true
+            archive: zip
+          - target: x86_64-pc-windows-gnu
+            os: ubuntu-latest
+            use_cross: true
+            use_upx: true
+            archive: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl-tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install UPX (ubuntu)
+        if: matrix.use_upx && runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y upx-ucl
+
+      - name: Install UPX (windows)
+        if: matrix.use_upx && runner.os == 'Windows'
+        shell: bash
+        run: choco install upx -y
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Build (cargo)
+        if: "!matrix.use_cross"
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (unix, original)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../trzsz-${{ github.ref_name }}-${{ matrix.target }}.tar.gz trzsz trz tsz
+
+      - name: Package (windows, original)
+        if: matrix.archive == 'zip'
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a ../../../trzsz-${{ github.ref_name }}-${{ matrix.target }}.zip trzsz.exe trz.exe tsz.exe
+
+      - name: UPX compress (unix)
+        if: matrix.use_upx && matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          mkdir -p upx
+          cp trzsz trz tsz upx/
+          upx --best upx/trzsz upx/trz upx/tsz
+
+      - name: UPX compress (windows)
+        if: matrix.use_upx && matrix.archive == 'zip'
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          mkdir -p upx
+          cp trzsz.exe trz.exe tsz.exe upx/
+          upx --best upx/trzsz.exe upx/trz.exe upx/tsz.exe
+
+      - name: Package (unix, upx)
+        if: matrix.use_upx && matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release/upx
+          tar czf ../../../trzsz-${{ github.ref_name }}-${{ matrix.target }}-upx.tar.gz trzsz trz tsz
+
+      - name: Package (windows, upx)
+        if: matrix.use_upx && matrix.archive == 'zip'
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release/upx
+          7z a ../../../trzsz-${{ github.ref_name }}-${{ matrix.target }}-upx.zip trzsz.exe trz.exe tsz.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trzsz-${{ matrix.target }}
+          path: trzsz-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+
+      - name: Upload artifact (zip)
+        if: matrix.archive == 'zip'
+        uses: actions/upload-artifact@v4
+        with:
+          name: trzsz-${{ matrix.target }}
+          path: trzsz-${{ github.ref_name }}-${{ matrix.target }}.zip
+
+      - name: Upload upx artifact (tar.gz)
+        if: matrix.use_upx && matrix.archive == 'tar.gz'
+        uses: actions/upload-artifact@v4
+        with:
+          name: trzsz-${{ matrix.target }}-upx
+          path: trzsz-${{ github.ref_name }}-${{ matrix.target }}-upx.tar.gz
+
+      - name: Upload upx artifact (zip)
+        if: matrix.use_upx && matrix.archive == 'zip'
+        uses: actions/upload-artifact@v4
+        with:
+          name: trzsz-${{ matrix.target }}-upx
+          path: trzsz-${{ github.ref_name }}-${{ matrix.target }}-upx.zip
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: trzsz-*
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release/ \;
+          cd release
+          sha256sum * > checksums-sha256.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release/*
