@@ -64,40 +64,40 @@ jobs:
             os: ubuntu-latest
             build_tool: cross
             archive: zip
-          # zigbuild + nightly (no cross Docker image, no prebuilt rust-std)
+          # cross (without pty, portable_pty not supported)
           - target: s390x-unknown-linux-musl
             os: ubuntu-latest
-            build_tool: zigbuild
+            build_tool: cross
             no_default_features: true
             archive: tar.gz
           - target: powerpc64le-unknown-linux-musl
             os: ubuntu-latest
-            build_tool: zigbuild
+            build_tool: cross
             no_default_features: true
             archive: tar.gz
           - target: riscv64gc-unknown-linux-musl
             os: ubuntu-latest
-            build_tool: zigbuild
+            build_tool: cross
             no_default_features: true
             archive: tar.gz
           - target: mips-unknown-linux-musl
             os: ubuntu-latest
-            build_tool: zigbuild
+            build_tool: cross
             no_default_features: true
             archive: tar.gz
           - target: mipsel-unknown-linux-musl
             os: ubuntu-latest
-            build_tool: zigbuild
+            build_tool: cross
             no_default_features: true
             archive: tar.gz
           - target: mips64el-unknown-linux-muslabi64
             os: ubuntu-latest
-            build_tool: zigbuild
+            build_tool: cross
             no_default_features: true
             archive: tar.gz
           - target: mips64-unknown-linux-muslabi64
             os: ubuntu-latest
-            build_tool: zigbuild
+            build_tool: cross
             no_default_features: true
             archive: tar.gz
 
@@ -105,14 +105,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Rust stable
+      - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Setup Rust nightly
-        if: matrix.build_tool == 'zigbuild'
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src
 
       - name: Install rust target
         if: matrix.build_tool == 'cargo'
@@ -126,10 +120,6 @@ jobs:
         if: matrix.build_tool == 'cross'
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Install cargo-zigbuild
-        if: matrix.build_tool == 'zigbuild'
-        run: pip install ziglang && cargo install cargo-zigbuild
-
       - name: Build (cargo)
         if: matrix.build_tool == 'cargo'
         run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.no_default_features && '--no-default-features' || '' }}
@@ -137,10 +127,6 @@ jobs:
       - name: Build (cross)
         if: matrix.build_tool == 'cross'
         run: cross build --release --locked --target ${{ matrix.target }} ${{ matrix.no_default_features && '--no-default-features' || '' }}
-
-      - name: Build (zigbuild)
-        if: matrix.build_tool == 'zigbuild'
-        run: cargo +nightly zigbuild --release --locked --target ${{ matrix.target }} -Zbuild-std=std,panic_abort ${{ matrix.no_default_features && '--no-default-features' || '' }}
 
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'

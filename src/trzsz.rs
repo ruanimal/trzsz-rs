@@ -224,9 +224,13 @@ impl Child for PtyChild {
             use std::os::unix::process::ExitStatusExt;
             Ok(std::process::ExitStatus::from_raw(status.exit_code() as i32))
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            // On non-unix, fall back to exit code 0
+            use std::os::windows::process::ExitStatusExt;
+            Ok(std::process::ExitStatus::from_raw(status.exit_code() as u32))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
             let _ = status;
             Ok(std::process::ExitStatus::from_raw(0))
         }
