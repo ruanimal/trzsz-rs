@@ -91,27 +91,16 @@ jobs:
             no_default_features: true
             use_upx: true
             archive: tar.gz
+          # musl-cross + build-std (prebuilt musl GCC cross-compiler, no portable_pty)
           - target: mips-unknown-linux-musl
             os: ubuntu-latest
-            build_tool: zigbuild
+            build_tool: musl_cross
             no_default_features: true
             use_upx: true
             archive: tar.gz
           - target: mipsel-unknown-linux-musl
             os: ubuntu-latest
-            build_tool: zigbuild
-            no_default_features: true
-            use_upx: true
-            archive: tar.gz
-          - target: mips64el-unknown-linux-muslabi64
-            os: ubuntu-latest
-            build_tool: zigbuild
-            no_default_features: true
-            use_upx: true
-            archive: tar.gz
-          - target: mips64-unknown-linux-muslabi64
-            os: ubuntu-latest
-            build_tool: zigbuild
+            build_tool: musl_cross
             no_default_features: true
             use_upx: true
             archive: tar.gz
@@ -128,6 +117,10 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
+
+      - name: Install rust-src (musl_cross)
+        if: matrix.build_tool == 'musl_cross'
+        run: rustup component add rust-src
 
       - name: Install rust target
         if: matrix.build_tool == 'cargo'
@@ -154,6 +147,23 @@ jobs:
         if: matrix.build_tool == 'zigbuild'
         run: pip install ziglang && cargo install cargo-zigbuild
 
+      - name: Install musl-cross GCC (musl_cross)
+        if: matrix.build_tool == 'musl_cross'
+        run: |
+          MUSL_TARGET=$(echo '${{ matrix.target }}' | sed 's/-unknown-linux-musl/-unknown-linux-muslsf/' | sed 's/labihf/sf/')
+          echo "MUSL_TARGET=${MUSL_TARGET}" >> $GITHUB_ENV
+          mkdir -p ./musl_gcc
+          wget --inet4-only -c "https://github.com/cross-tools/musl-cross/releases/download/20250520/${MUSL_TARGET}.tar.xz" -P ./musl_gcc/
+          tar xf "./musl_gcc/${MUSL_TARGET}.tar.xz" -C ./musl_gcc/
+          sudo ln -sf "$(pwd)/musl_gcc/${MUSL_TARGET}/bin/"*gcc /usr/bin/
+          sudo ln -sf "$(pwd)/musl_gcc/${MUSL_TARGET}/include/" /usr/include/musl-cross
+          sudo ln -sf "$(pwd)/musl_gcc/${MUSL_TARGET}/${MUSL_TARGET}/sysroot/" ./musl_gcc/sysroot
+          # Fix libunwind for panic=abort
+          cd "./musl_gcc/${MUSL_TARGET}/lib/gcc/${MUSL_TARGET}/"15*/ || exit 0
+          if [ -f libgcc_eh.a ] && [ ! -f libunwind.a ]; then
+            sudo cp libgcc_eh.a libunwind.a
+          fi
+
       - name: Build (cargo)
         if: matrix.build_tool == 'cargo'
         run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.no_default_features && '--no-default-features' || '' }}
@@ -166,6 +176,18 @@ jobs:
         if: matrix.build_tool == 'zigbuild'
         run: cargo +nightly zigbuild --release --locked --target ${{ matrix.target }} -Zbuild-std=std,panic_abort ${{ matrix.no_default_features && '--no-default-features' || '' }}
         env:
+          RUSTFLAGS: -C link-self-contained=no
+
+      - name: Build (musl_cross)
+        if: matrix.build_tool == 'musl_cross'
+        run: |
+          MUSL_BIN="$PWD/musl_gcc/$MUSL_TARGET/bin/$MUSL_TARGET"
+          TARGET_VAR=$(echo '${{ matrix.target }}' | tr '[:lower:]-' '[:upper:]_')
+          export CC_${TARGET_VAR}="${MUSL_BIN}-gcc"
+          export CARGO_TARGET_${TARGET_VAR}_LINKER="${MUSL_BIN}-gcc"
+          cargo build --release --locked --target ${{ matrix.target }} -Z build-std=std,panic_abort ${{ matrix.no_default_features && '--no-default-features' || '' }}
+        env:
+          RUSTC_BOOTSTRAP: 1
           RUSTFLAGS: -C link-self-contained=no
 
       - name: Package (unix, original)
