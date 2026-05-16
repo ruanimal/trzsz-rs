@@ -36,11 +36,20 @@ pub fn trzsz_main(args: &TrzszArgs) -> i32 {
     }
 
     if args.args.is_empty() {
-        print_trzsz_help();
+        // clap already prints help via --help, but if no args given, print usage
+        eprintln!("usage: trzsz [-h] [-v] [-r] [-t] [-d] [-z] [-o] command line");
         return 0;
     }
 
-    // Cleanup on exit would be registered here
+    // Register cleanup on exit (restore terminal state)
+    let _ = ctrlc::set_handler(|| {
+        // Best-effort terminal restore on Ctrl+C
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b"\x1b[?25h"); // show cursor
+        let _ = out.write_all(b"\x1b[0m");   // reset attributes
+        let _ = out.flush();
+    });
 
     // Setup virtual terminal on Windows
     if let Err(e) = setup_virtual_terminal() {
@@ -63,7 +72,7 @@ pub fn trzsz_main(args: &TrzszArgs) -> i32 {
             detect_trace_log: args.tracelog,
             ..Default::default()
         };
-        let filter = TrzszFilter::new(
+        let mut filter = TrzszFilter::new(
             Box::new(io::stdin()),
             Box::new(io::stdout()),
             pty_stdin,
@@ -88,7 +97,7 @@ pub fn trzsz_main(args: &TrzszArgs) -> i32 {
             enable_zmodem: args.zmodem,
             enable_osc52: args.osc52,
         };
-        let filter = TrzszFilter::new(
+        let mut filter = TrzszFilter::new(
             Box::new(io::stdin()),
             Box::new(io::stdout()),
             pty_stdin,
@@ -110,21 +119,6 @@ pub fn trzsz_main(args: &TrzszArgs) -> i32 {
     status.code().unwrap_or(-1)
 }
 
-fn print_trzsz_help() {
-    eprint!("usage: trzsz [-h] [-v] [-r] [-t] [-d] [-z] [-o] command line\n\n");
-    eprint!("Wrapping command line to support trzsz ( trz / tsz ).\n\n");
-    eprint!("positional arguments:\n");
-    eprint!("  command line       the original command line\n\n");
-    eprint!("optional arguments:\n");
-    eprint!("  -h, --help         show this help message and exit\n");
-    eprint!("  -v, --version      show version number and exit\n");
-    eprint!("  -r, --relay        run as a trzsz relay server\n");
-    eprint!("  -t, --tracelog     enable trace log for debugging\n");
-    eprint!("  -d, --dragfile     enable drag file(s) to upload\n");
-    eprint!("  -z, --zmodem       enable zmodem lrzsz (rz / sz)\n");
-    eprint!("  -o, --osc52        enable clipboard integration\n");
-}
-
 fn setup_virtual_terminal() -> Result<(), TrzszError> {
     #[cfg(windows)]
     {
@@ -138,45 +132,64 @@ fn get_terminal_columns() -> i32 {
 }
 
 /// Spawn a pseudo-terminal and run the command.
-fn spawn_pty(args: &[String]) -> Result<(Box<dyn Write + Send>, Box<dyn Read + Send>, Box<dyn Child>), TrzszError> {
+fn spawn_pty(args: &[String]) -> Result<(Box<dyn Write + Send>, Box<dyn Read + Send>, Box<dyn Child + Send>), TrzszError> {
     let cmd = &args[0];
     let cmd_args = &args[1..];
 
-    #[cfg(unix)]
-    {
-        use std::process::Command;
-        let mut cmd = Command::new(cmd);
-        cmd.args(cmd_args);
-        cmd.stdin(std::process::Stdio::piped());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    let pty_system = native_pty_system();
 
-        let mut child = cmd.spawn().map_err(|e| {
-            comm::simple_trzsz_error("Spawn process failed", e)
+    let pty_size = PtySize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let pty_pair = pty_system.openpty(pty_size).map_err(|e| {
+        comm::simple_trzsz_error("Open PTY failed", e)
+    })?;
+
+    let mut cmd_builder = CommandBuilder::new(cmd);
+    cmd_builder.args(cmd_args);
+
+    let child = pty_pair.slave.spawn_command(cmd_builder).map_err(|e| {
+        comm::simple_trzsz_error("Spawn command on PTY failed", e)
+    })?;
+
+    // The master side is the pty handle for reading/writing
+    let reader = pty_pair.master.try_clone_reader().map_err(|e| {
+        comm::simple_trzsz_error("Clone PTY reader failed", e)
+    })?;
+    let writer = pty_pair.master.take_writer().map_err(|e| {
+        comm::simple_trzsz_error("Take PTY writer failed", e)
+    })?;
+
+    Ok((Box::new(writer), Box::new(reader), Box::new(PtyChild { child, _pty_pair: pty_pair })))
+}
+
+struct PtyChild {
+    child: Box<dyn portable_pty::Child + Send>,
+    _pty_pair: portable_pty::PtyPair,
+}
+
+impl Child for PtyChild {
+    fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        let status = self.child.wait().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, e)
         })?;
-
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-
-        Ok((Box::new(stdin), Box::new(stdout), Box::new(child)))
-    }
-    #[cfg(not(unix))]
-    {
-        use std::process::Command;
-        let mut cmd = Command::new(cmd);
-        cmd.args(cmd_args);
-        cmd.stdin(std::process::Stdio::piped());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        let mut child = cmd.spawn().map_err(|e| {
-            comm::simple_trzsz_error("Spawn process failed", e)
-        })?;
-
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-
-        Ok((Box::new(stdin), Box::new(stdout), Box::new(child)))
+        // portable_pty ExitStatus wraps the process ExitStatus
+        // Convert via exit_code() -> from_raw
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            Ok(std::process::ExitStatus::from_raw(status.exit_code() as i32))
+        }
+        #[cfg(not(unix))]
+        {
+            // On non-unix, fall back to exit code 0
+            let _ = status;
+            Ok(std::process::ExitStatus::from_raw(0))
+        }
     }
 }
 

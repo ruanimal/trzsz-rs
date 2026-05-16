@@ -64,6 +64,9 @@ pub struct TrzszFilter {
     pub trigger: Option<TrzszTrigger>,
     pub interrupting: AtomicBool,
     pub closed: AtomicBool,
+    pub default_upload_path: Option<String>,
+    pub default_download_path: Option<String>,
+    pub drag_file_upload_command: Option<String>,
 }
 
 impl TrzszFilter {
@@ -85,6 +88,9 @@ impl TrzszFilter {
             trigger: None,
             interrupting: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            default_upload_path: None,
+            default_download_path: None,
+            drag_file_upload_command: None,
         };
         filter
     }
@@ -107,7 +113,7 @@ impl TrzszFilter {
     }
 
     /// Read trzsz config from ~/.trzsz.conf
-    pub fn read_trzsz_config(&self) {
+    pub fn read_trzsz_config(&mut self) {
         if let Ok(home) = std::env::var("HOME") {
             let config_path = std::path::Path::new(&home).join(".trzsz.conf");
             if let Ok(content) = std::fs::read_to_string(&config_path) {
@@ -124,8 +130,18 @@ impl TrzszFilter {
                         if name.is_empty() || value.is_empty() {
                             continue;
                         }
-                        // Config values would be applied here
-                        let _ = (name, value);
+                        match name.as_str() {
+                            "defaultuploadpath" if self.default_upload_path.is_none() => {
+                                self.default_upload_path = Some(value);
+                            }
+                            "defaultdownloadpath" if self.default_download_path.is_none() => {
+                                self.default_download_path = Some(value);
+                            }
+                            "dragfileuploadcommand" if self.drag_file_upload_command.is_none() => {
+                                self.drag_file_upload_command = Some(value);
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }

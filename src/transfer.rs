@@ -499,9 +499,28 @@ impl TrzszTransfer {
         self.reset_term(msg, false);
     }
 
-    fn reset_term(&self, msg: &str, _ignorable: bool) {
-        let _ = msg;
-        // Terminal reset logic would go here
+    fn reset_term(&self, msg: &str, ignorable: bool) {
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        if !ignorable {
+            // Save cursor, move to top-left, set green background, print message, restore
+            let _ = out.write_all(b"\x1b[s\x1b[H\x1b[42;30m");
+            // Write message replacing newlines with clear-to-end-of-line
+            for line in msg.split('\n') {
+                let _ = out.write_all(line.as_bytes());
+                let _ = out.write_all(b"\x1b[K\r\n");
+            }
+            let _ = out.write_all(b"\x1b[0m\x1b[u");
+            let _ = out.flush();
+        } else {
+            // Restore cursor position and clear below
+            let _ = out.write_all(b"\x1b[u\x1b[0J");
+            let _ = out.write_all(msg.as_bytes());
+            let _ = out.write_all(b"\r\n");
+            crate::comm::show_cursor(&mut out);
+            let _ = out.flush();
+        }
     }
 
     pub fn add_created_files(&mut self, path: &str) {

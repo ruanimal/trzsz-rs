@@ -22,7 +22,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use unicode_width::UnicodeWidthStr;
@@ -176,6 +178,7 @@ impl RecentSpeed {
 // ─── Text progress bar ─────────────────────────────────────────────────────
 
 pub struct TextProgressBar {
+    writer: Arc<Mutex<dyn Write + Send>>,
     pub columns: AtomicI32,
     tmux_pane_columns: AtomicI32,
     file_count: i32,
@@ -193,13 +196,14 @@ pub struct TextProgressBar {
 }
 
 impl TextProgressBar {
-    pub fn new(columns: i32, tmux_pane_columns: i32, tmux_prefix: &str) -> Self {
+    pub fn new(writer: Arc<Mutex<dyn Write + Send>>, columns: i32, tmux_pane_columns: i32, tmux_prefix: &str) -> Self {
         let effective_columns = if tmux_pane_columns > 1 {
             tmux_pane_columns - 1
         } else {
             columns
         };
         TextProgressBar {
+            writer,
             columns: AtomicI32::new(effective_columns),
             tmux_pane_columns: AtomicI32::new(tmux_pane_columns),
             file_count: 0,
@@ -226,13 +230,24 @@ impl TextProgressBar {
     }
 
     fn write_progress(&self, progress: &str) {
-        let data = progress.as_bytes();
-        if !self.tmux_prefix.is_empty() {
-            let _ = data; // Would encode tmux output in real implementation
+        if let Ok(mut writer) = self.writer.lock() {
+            if !self.tmux_prefix.is_empty() {
+                let data = progress.as_bytes();
+                let mut encoded = Vec::with_capacity(self.tmux_prefix.len() + data.len() * 4 + 2);
+                encoded.extend_from_slice(self.tmux_prefix.as_bytes());
+                for &b in data {
+                    if b < b' ' || b == b'\\' || b > b'~' {
+                        encoded.extend_from_slice(format!("\\{:03o}", b).as_bytes());
+                    } else {
+                        encoded.push(b);
+                    }
+                }
+                encoded.extend_from_slice(b"\r\n");
+                let _ = writer.write_all(&encoded);
+            } else {
+                let _ = writer.write_all(progress.as_bytes());
+            }
         }
-        // In a real implementation, this would write to the server stdin
-        // For now, write directly to stderr for debugging
-        let _ = std::io::Write::write_all(&mut std::io::stderr(), data);
     }
 
     fn show_progress(&mut self) {
