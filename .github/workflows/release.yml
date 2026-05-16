@@ -194,15 +194,13 @@ jobs:
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../trzsz-${{ github.ref_name }}-${{ matrix.target }}.tar.gz trzsz trz tsz
+          tar czf trzsz-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release trzsz trz tsz
 
       - name: Package (windows, original)
         if: matrix.archive == 'zip'
         shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../trzsz-${{ github.ref_name }}-${{ matrix.target }}.zip trzsz.exe trz.exe tsz.exe
+          7z a trzsz-${{ github.ref_name }}-${{ matrix.target }}.zip ./target/${{ matrix.target }}/release/trzsz.exe ./target/${{ matrix.target }}/release/trz.exe ./target/${{ matrix.target }}/release/tsz.exe
 
       - name: UPX compress (unix)
         if: matrix.use_upx && matrix.archive == 'tar.gz'
@@ -226,15 +224,13 @@ jobs:
         if: matrix.use_upx && matrix.archive == 'tar.gz'
         shell: bash
         run: |
-          cd target/${{ matrix.target }}/release/upx
-          tar czf ../../../trzsz-${{ github.ref_name }}-${{ matrix.target }}-upx.tar.gz trzsz trz tsz
+          tar czf trzsz-${{ github.ref_name }}-${{ matrix.target }}-upx.tar.gz -C target/${{ matrix.target }}/release/upx trzsz trz tsz
 
       - name: Package (windows, upx)
         if: matrix.use_upx && matrix.archive == 'zip'
         shell: bash
         run: |
-          cd target/${{ matrix.target }}/release/upx
-          7z a ../../../trzsz-${{ github.ref_name }}-${{ matrix.target }}-upx.zip trzsz.exe trz.exe tsz.exe
+          7z a trzsz-${{ github.ref_name }}-${{ matrix.target }}-upx.zip ./target/${{ matrix.target }}/release/upx/trzsz.exe ./target/${{ matrix.target }}/release/upx/trz.exe ./target/${{ matrix.target }}/release/upx/tsz.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
