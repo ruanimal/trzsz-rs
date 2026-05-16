@@ -25,11 +25,13 @@ SOFTWARE.
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::path::Path;use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use sha2::{Sha256, Digest};
+use sha2::Digest;
+use md5::Md5;
 
 use crate::buffer::TrzszBuffer;
 use crate::comm::{
@@ -44,7 +46,9 @@ use crate::progress::ProgressCallback;
 pub const K_PROTOCOL_VERSION2: i32 = 2;
 pub const K_PROTOCOL_VERSION3: i32 = 3;
 pub const K_PROTOCOL_VERSION4: i32 = 4;
-pub const K_PROTOCOL_VERSION: i32 = K_PROTOCOL_VERSION4;
+// Use protocol version 1 for now: V2+ requires streaming encode/decode pipeline
+// which is not yet implemented. V1 uses simple stop-and-wait with per-chunk ack.
+pub const K_PROTOCOL_VERSION: i32 = 1;
 pub const K_LAST_CHUNK_TIME_COUNT: usize = 10;
 
 // ─── Transfer Action (JSON over protocol) ──────────────────────────────────
@@ -159,6 +163,7 @@ pub struct TrzszTransfer {
     pub writer: Box<dyn Write + Send>,
     pub stopped: AtomicBool,
     pub stop_and_delete: AtomicBool,
+    pub term_reseted: AtomicBool,
     pub clean_timeout: Duration,
     pub last_input_time: AtomicI64,
     pub last_chunk_time_arr: [Duration; K_LAST_CHUNK_TIME_COUNT],
@@ -181,6 +186,7 @@ impl TrzszTransfer {
             writer,
             stopped: AtomicBool::new(false),
             stop_and_delete: AtomicBool::new(false),
+            term_reseted: AtomicBool::new(false),
             clean_timeout: Duration::from_millis(100),
             last_input_time: AtomicI64::new(0),
             last_chunk_time_arr: [Duration::ZERO; K_LAST_CHUNK_TIME_COUNT],
@@ -251,6 +257,12 @@ impl TrzszTransfer {
 
     pub fn write_all(&mut self, buf: &[u8]) -> Result<(), TrzszError> {
         write_all(&mut self.writer, buf).map_err(|e| {
+            TrzszError { message: e.to_string(), err_type: String::new(), trace: false }
+        })?;
+        // Flush after every write to prevent the OS-level stdout buffer from
+        // delaying transfer data. Without this, the receiver may wait forever
+        // for chunks that are still sitting in the local stdout buffer.
+        self.writer.flush().map_err(|e| {
             TrzszError { message: e.to_string(), err_type: String::new(), trace: false }
         })
     }
@@ -352,6 +364,9 @@ impl TrzszTransfer {
             return self.recv_binary("DATA", false, timeout);
         }
         let size = self.recv_integer("DATA", false, timeout)?;
+        if size == 0 {
+            return Ok(vec![]);
+        }
         let data = self.buffer.read_binary(size as usize, timeout)?;
         let table = self.get_escape_table();
         let (unescaped, remaining) = escape::unescape_data(&data, &table, None)?;
@@ -478,15 +493,19 @@ impl TrzszTransfer {
     pub fn clean_input(&mut self, timeout_duration: Duration) {
         self.stopped.store(true, Ordering::SeqCst);
         self.buffer.drain_buffer();
-        let now = std::time::SystemTime::now()
+        let start_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        self.last_input_time.store(now, Ordering::SeqCst);
+        self.last_input_time.store(start_ms, Ordering::SeqCst);
         loop {
-            let elapsed = timeout_duration.as_millis() as i64;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
             let last = self.last_input_time.load(Ordering::SeqCst);
-            let remaining = elapsed - (now - last);
+            let elapsed_since_last = now_ms - last;
+            let remaining = timeout_duration.as_millis() as i64 - elapsed_since_last;
             if remaining <= 0 {
                 return;
             }
@@ -503,24 +522,38 @@ impl TrzszTransfer {
         use std::io::Write;
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
-        if !ignorable {
-            // Save cursor, move to top-left, set green background, print message, restore
-            let _ = out.write_all(b"\x1b[s\x1b[H\x1b[42;30m");
-            // Write message replacing newlines with clear-to-end-of-line
-            for line in msg.split('\n') {
-                let _ = out.write_all(line.as_bytes());
-                let _ = out.write_all(b"\x1b[K\r\n");
+
+        // Already reset once: just print the green banner at the top of the
+        // screen (if not ignorable), then return without touching the saved
+        // cursor position again.
+        if self.term_reseted
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            if !ignorable {
+                let normalized = msg.replace("\r\n", "\n").replace('\n', "\x1b[K\r\n");
+                let banner = format!("\x1b[s\x1b[H\x1b[42;30m{}\x1b[K\x1b[0m\x1b[u", normalized);
+                let _ = out.write_all(banner.as_bytes());
+                let _ = out.flush();
             }
-            let _ = out.write_all(b"\x1b[0m\x1b[u");
-            let _ = out.flush();
+            return;
+        }
+
+        // First call: restore cursor to the saved position (set by the
+        // initial "\x1b[s" in the trigger header), clear screen below it,
+        // print the message, and re-show the cursor. Stdin is restored to
+        // its pre-raw state via the RawModeGuard Drop in tsz_main/trz_main.
+        if crate::comm::is_running_on_windows() {
+            let normalized = msg.replace('\n', "\r\n");
+            let _ = out.write_all(b"\x1b[H\x1b[2J\x1b[?1049l");
+            let _ = out.write_all(normalized.as_bytes());
         } else {
-            // Restore cursor position and clear below
             let _ = out.write_all(b"\x1b[u\x1b[0J");
             let _ = out.write_all(msg.as_bytes());
-            let _ = out.write_all(b"\r\n");
-            crate::comm::show_cursor(&mut out);
-            let _ = out.flush();
         }
+        let _ = out.write_all(b"\r\n");
+        crate::comm::show_cursor(&mut out);
+        let _ = out.flush();
     }
 
     pub fn add_created_files(&mut self, path: &str) {
@@ -604,7 +637,7 @@ impl TrzszTransfer {
         let mut step: i64 = 0;
         let mut buf_size: usize = 1024;
         let mut buffer = vec![0u8; buf_size];
-        let mut hasher = Sha256::new();
+        let mut hasher = Md5::new();
         let size = file.size();
 
         while step < size {
@@ -697,7 +730,7 @@ impl TrzszTransfer {
 
     pub fn recv_file_data(&mut self, file: &mut dyn FileWriter, size: i64) -> Result<Vec<u8>, TrzszError> {
         let mut step: i64 = 0;
-        let mut hasher = Sha256::new();
+        let mut hasher = Md5::new();
         while step < size {
             let begin_time = Instant::now();
             let data = self.recv_data()?;

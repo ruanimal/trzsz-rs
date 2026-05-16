@@ -261,8 +261,21 @@ pub fn check_paths_readable(
         if !directory && metadata.is_dir() {
             return Err(simple_trzsz_error("Is a directory", abs_path.display()));
         }
+        // Initial rel_path must contain the file/dir name so the receiver
+        // knows what to call the file (matches trzsz-go behavior).
+        let initial_name = abs_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
         let mut visited = std::collections::HashSet::new();
-        check_path_readable_recursive(i as i32, &abs_path, &metadata, &mut list, vec![], &mut visited)?;
+        check_path_readable_recursive(
+            i as i32,
+            &abs_path,
+            &metadata,
+            &mut list,
+            vec![initial_name],
+            &mut visited,
+        )?;
     }
     Ok(list)
 }

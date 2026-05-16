@@ -34,6 +34,36 @@ use crate::escape::get_escape_chars;
 use crate::transfer::TrzszTransfer;
 use crate::version::TRZSZ_VERSION;
 
+#[cfg(unix)]
+struct RawModeGuard {
+    fd: std::os::unix::io::RawFd,
+    saved: nix::sys::termios::Termios,
+}
+
+#[cfg(unix)]
+impl RawModeGuard {
+    fn enter(fd: std::os::unix::io::RawFd) -> Option<Self> {
+        use nix::sys::termios::{tcgetattr, tcsetattr, SetArg};
+        let saved = tcgetattr(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }).ok()?;
+        let mut raw = saved.clone();
+        nix::sys::termios::cfmakeraw(&mut raw);
+        tcsetattr(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }, SetArg::TCSANOW, &raw).ok()?;
+        Some(RawModeGuard { fd, saved })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        use nix::sys::termios::{tcsetattr, SetArg};
+        let _ = tcsetattr(
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(self.fd) },
+            SetArg::TCSANOW,
+            &self.saved,
+        );
+    }
+}
+
 pub fn trz_main(args: &TrzArgs) -> i32 {
     // Fork to background
     if args.base.fork {
@@ -87,6 +117,14 @@ pub fn trz_main(args: &TrzArgs) -> i32 {
     let header = format!("\x1b[s::TRZSZ:TRANSFER:{}:{}:{:013}:0\r\n", mode, TRZSZ_VERSION, unique_id);
     let _ = io::stdout().write_all(header.as_bytes());
     let _ = io::stdout().flush();
+
+    // Put stdin in raw mode so the filter's protocol bytes (ACT, ACK, etc.)
+    // are not echoed back as "server output" and aren't line-buffered.
+    #[cfg(unix)]
+    let _raw_guard = {
+        use std::os::unix::io::AsRawFd;
+        RawModeGuard::enter(io::stdin().as_raw_fd())
+    };
 
     // Setup transfer
     let mut transfer = TrzszTransfer::new(Box::new(io::stdout()));

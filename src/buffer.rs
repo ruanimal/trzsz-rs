@@ -70,10 +70,10 @@ impl TrzszBuffer {
     pub fn next_buffer(&mut self) -> Result<Vec<u8>, TrzszError> {
         if let Some(ref buf) = self.next_buf {
             if self.next_idx < buf.len() {
-                let result = buf[self.next_idx..].to_vec();
-                self.next_buf = None;
-                self.next_idx = 0;
-                return Ok(result);
+                // Return remaining slice without clearing next_buf, so the
+                // caller can update next_idx and we can continue reading from
+                // the same buffer on the next call.
+                return Ok(buf[self.next_idx..].to_vec());
             }
         }
         self.next_buf = None;
@@ -120,11 +120,14 @@ impl TrzszBuffer {
             let newline_idx = buf.iter().position(|&b| b == b'\n');
 
             if let Some(idx) = newline_idx {
-                self.next_idx = idx + 1;
+                // Advance next_idx past the newline so subsequent reads start
+                // after this line. Use += to match Go's behavior, since the
+                // returned `buf` is a slice starting at the original next_idx.
+                self.next_idx += idx + 1;
                 let line = &buf[..idx];
                 if may_has_junk && !self.read_buf.is_empty() && self.read_buf.last() == Some(&b'\r') {
                     self.read_buf.truncate(self.read_buf.len() - 1);
-                    self.read_buf.extend_from_slice(&buf[..idx]);
+                    self.read_buf.extend_from_slice(line);
                     continue;
                 }
                 self.read_buf.extend_from_slice(line);
@@ -134,6 +137,9 @@ impl TrzszBuffer {
                 return Ok(self.read_buf.clone());
             }
 
+            // Whole buffer consumed without newline; advance next_idx so the
+            // next read pulls from the channel.
+            self.next_idx += buf.len();
             if buf.contains(&0x03) {
                 return Err(err_interrupted());
             }
@@ -150,11 +156,10 @@ impl TrzszBuffer {
             let buf = self.next_buffer()?;
             let left = size - self.read_buf.len();
             if buf.len() > left {
-                self.next_idx = left;
+                self.next_idx += left;
                 self.read_buf.extend_from_slice(&buf[..left]);
             } else {
-                self.next_buf = None;
-                self.next_idx = 0;
+                self.next_idx += buf.len();
                 self.read_buf.extend_from_slice(&buf);
             }
         }
@@ -182,13 +187,22 @@ impl TrzszBuffer {
                 }
             }
 
-            let line_end = new_line_idx.unwrap_or(buf.len());
-            if new_line_idx.is_some() {
-                let rest = &buf[new_line_idx.unwrap() + 1..];
-                if !rest.is_empty() && rest[0] == b'\n' {
-                    // skip newline after '!'
+            // Advance next_idx so subsequent reads continue past this segment.
+            if let Some(idx) = new_line_idx {
+                self.next_idx += idx + 1;
+                // Skip optional newline after '!'
+                if self.next_idx < self.next_buf.as_ref().map(|b| b.len()).unwrap_or(0) {
+                    if let Some(ref nb) = self.next_buf {
+                        if nb[self.next_idx] == b'\n' {
+                            self.next_idx += 1;
+                        }
+                    }
                 }
-            };
+            } else {
+                self.next_idx += buf.len();
+            }
+
+            let line_end = new_line_idx.unwrap_or(buf.len());
 
             let data = &buf[..line_end];
 
@@ -266,5 +280,52 @@ mod tests {
         assert!(!is_trzsz_letter(b' '));
         assert!(!is_trzsz_letter(b'\n'));
         assert!(!is_trzsz_letter(0x1b));
+    }
+
+    #[test]
+    fn test_read_line_then_binary_in_one_chunk() {
+        // Regression test: a single received chunk contains both a line
+        // (e.g. "#DATA:5\n") and the binary payload that follows. The buffer
+        // must not lose the bytes after the newline.
+        let mut buf = TrzszBuffer::new();
+        let mut data = Vec::new();
+        data.extend_from_slice(b"#DATA:5\n");
+        data.extend_from_slice(b"hello");
+        data.extend_from_slice(b"#SUCC:5\n");
+        buf.add_buffer(&data);
+
+        let line = buf.read_line(false, None).unwrap();
+        assert_eq!(line, b"#DATA:5");
+
+        let bin = buf.read_binary(5, None).unwrap();
+        assert_eq!(bin, b"hello");
+
+        let line2 = buf.read_line(false, None).unwrap();
+        assert_eq!(line2, b"#SUCC:5");
+    }
+
+    #[test]
+    fn test_read_multiple_lines_in_one_chunk() {
+        // Regression test: a single received chunk contains multiple lines.
+        // The buffer must return them one at a time.
+        let mut buf = TrzszBuffer::new();
+        buf.add_buffer(b"#A:1\n#B:2\n#C:3\n");
+
+        assert_eq!(buf.read_line(false, None).unwrap(), b"#A:1");
+        assert_eq!(buf.read_line(false, None).unwrap(), b"#B:2");
+        assert_eq!(buf.read_line(false, None).unwrap(), b"#C:3");
+    }
+
+    #[test]
+    fn test_read_binary_across_chunks() {
+        // Binary read must reassemble bytes from multiple incoming chunks.
+        let mut buf = TrzszBuffer::new();
+        buf.add_buffer(b"#DATA:10\nabc");
+        buf.add_buffer(b"defgh");
+        buf.add_buffer(b"ij#NEXT:1\n");
+
+        assert_eq!(buf.read_line(false, None).unwrap(), b"#DATA:10");
+        assert_eq!(buf.read_binary(10, None).unwrap(), b"abcdefghij");
+        assert_eq!(buf.read_line(false, None).unwrap(), b"#NEXT:1");
     }
 }
