@@ -1,5 +1,7 @@
 # trzsz-rs vs trzsz-go：文件传输链路差距分析
 
+> 实施顺序与里程碑见 [`docs/roadmap.md`](roadmap.md)；客户端/库侧差距见 [`docs/library-porting-checklist.md`](library-porting-checklist.md)。
+
 **范围**：只看 `trz`/`tsz` 与对端之间的文件传输协议与实现，即 `src/transfer.rs`、`src/buffer.rs`、`src/escape.rs`、`src/comm.rs`（路径/校验部分）、`src/progress.rs`、`src/trz.rs`、`src/tsz.rs` 的传输流程。
 **明确排除**：`trzsz` 包装器（ssh/pty/数据泵）、relay、拖拽上传、zmodem、OSC52、文件选择对话框等非传输项。
 **参考实现**：`trzsz-go` @ `4432ed0`（子模块已检出）。

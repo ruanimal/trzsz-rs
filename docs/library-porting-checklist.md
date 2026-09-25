@@ -1,5 +1,7 @@
 # trzsz-rs 库化路线：Go 库 API → Rust 目标 API 移植清单
 
+> 实施顺序与里程碑见 [`docs/roadmap.md`](roadmap.md)；服务端传输差距见 [`docs/transfer-gap-vs-go.md`](transfer-gap-vs-go.md)。
+
 **背景**：`trzsz-go` 不只是 CLI，还是被真实项目依赖的 Go 库（pkg.go.dev "Imported by" 3 个模块 / 6 个包：`trzsz/trzsz-ssh/tssh`、`abakum/{cssh,dssh,trzsz-ssh}/tssh`、`jixishi/SerialTerminalForWindowsTerminal`、`shoaibashk/nanocom`），核心价值是 `TrzszFilter` —— 让宿主终端程序在本地侧具备触发上传/下载的能力。
 `trzsz-rs` 结构上同样是 lib + bin（`src/lib.rs` 11 个 `pub mod`，`Cargo.toml` 无 `[lib]` 段、无 `publish = false`），但客户端过滤器层是空壳。
 
