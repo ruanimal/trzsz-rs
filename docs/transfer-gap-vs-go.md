@@ -5,8 +5,9 @@
 ## 当前进度
 
 - **Roadmap 第 1 步 / 传输 P0：已完成**（实现见提交 `06ab606`）：修复 Latin-1 转义、收发数据零进展、畸形协议行、`-r`、binary 降级及 `tmux_output_junk`。
-- 新增 `tests/transfer_p0.rs`，覆盖 14 个无需 Go 工具链的回归场景；`cargo fmt --check` 与 `cargo test` 已通过。
-- **仍待处理**：权限保留、普通文件删除、文件句柄关闭、实时进度、Ctrl+C 取消，以及协议 V2+ 能力（见第五节）。
+- **剩余传输 P1：已完成**：接收文件/目录按 Go 的 `perm | 0600` / `perm | 0700` 创建；停止删除兼容普通文件和目录；发送/接收句柄在成功、失败路径均 close；逐 DATA chunk 调用进度回调，`trz`/`tsz` 接入 stderr 进度条；Ctrl+C 通过共享 stop 状态唤醒 buffer 等待。
+- 回归测试：`tests/transfer_p0.rs` 覆盖 14 个本地场景；新增 `tests/transfer_p1.rs` 覆盖双向多块进度、文件/目录及默认权限、stop/delete 与保留文件、无传输超时的取消唤醒；另有 writer close 成功/失败和进度条渲染单测。`cargo fmt --check`、`cargo test`、`cargo build --locked` 均通过。
+- **仍待处理**：协议 V2+ 能力（见第五节），不属于本轮 P1。
 - **真实 Go 互通已部分验证**：从 `./trzsz-go/cmd` 构建后，`tests/interop.rs` 的 Go filter ↔ Rust `tsz` 小文件及 256 KiB 文件用例通过；另用 Go `TrzszFilter.OneTimeUpload` → Rust `trz -b -e` 验证了含 16 个控制/二进制字节的原样落盘。仓库互通测试仍硬编码 `/tmp/go-*`，缺少这些文件时可能静默跳过。
 
 **范围**：只看 `trz`/`tsz` 与对端之间的文件传输协议与实现，即 `src/transfer.rs`、`src/buffer.rs`、`src/escape.rs`、`src/comm.rs`（路径/校验部分）、`src/progress.rs`、`src/trz.rs`、`src/tsz.rs` 的传输流程。
@@ -75,7 +76,7 @@ trz -d <目录>  → 触发头 D ✓
 
 `src/trz.rs:107-112`、`src/tsz.rs:104-109` 打印 "auto switch to base64 mode" 后**没有清 flag**，后面 `let mut binary = args.base.binary` 照样为 true；Go 是 `args.Binary = false`（`trz.go:149-156`）。结果：在 tmux / Windows 下声称降级，实际仍按 binary 走。
 
-### 6. 文件权限不保留【P1 待处理】
+### 6. 文件权限不保留【P1 已修复】
 
 目录上传实测：NAME 里带 `perm: 0o755`，落盘结果
 
@@ -86,19 +87,18 @@ trz -d <目录>  → 触发头 D ✓
 
 Go `doCreateFile`/`doCreateDirectory`（`transfer.go:1016-1048`）用 `perm | 0600` / `perm | 0700` 作为创建 mode，缺省 0644/0755；Rust 用 `fs::File::create` / `create_dir_all`（`transfer.rs:842,860`），只吃 umask，**源文件的 mode 位完全丢失**。
 
-### 7. Ctrl+C 停不下来【P1 待处理】
+### 7. Ctrl+C 停不下来【P1 已修复】
 
 Go `handleServerSignal`：SIGINT/SIGTERM → `stopTransferringFiles(false)`（`comm.go:568-575`）。Rust 的 ctrlc handler 只往一个**没有任何读取方**的 `AtomicBool` 写（`src/trz.rs:158-162`、`src/tsz.rs:156-160`），`stop_transferring_files`（`transfer.rs:240`）无人调用，`TrzszBuffer` 也没有 stop channel（`transfer.rs:245` 注释写着 `// Signal buffer to stop`，下面是空的）→ **传输中无法中断**，只能等 chunk 超时。
 
-### 8. stop & delete 删不掉文件【P1 待处理】
+### 8. stop & delete 删不掉文件【P1 已修复】
 
 `delete_created_files`（`transfer.rs:584-594`）只调 `fs::remove_dir_all`，普通文件不会被删（Go 用 `os.RemoveAll`，`transfer.go:745-756`）→ "停止并删除" 只能删目录，文件残留。
 
-### 9. 进度回调链路断了【P1 待处理】
+### 9. 进度回调链路断了【P1 已修复】
 
-- `ProgressCallback::on_step`（`progress.rs:36,398`）**全项目无调用点**；`send_file_data`/`recv_file_data` 不接 progress 参数（Go 每 chunk 调 `progress.onStep`，`transfer.go:878,911,1176,1191`）。
-- `TextProgressBar::new` 零调用，`trz.rs:223` / `tsz.rs:214` 传 `&mut None` → 进度条从不显示。
-- 顺带：文件句柄从不 `close()`（`FileWriter::close` 无调用点，Go 是 defer close）。
+- `send_file_data` / `recv_file_data` 现在逐 DATA chunk 调 `ProgressCallback::on_step`；`trz` / `tsz` 在非 quiet 模式创建 `TextProgressBar` 并接入回调。
+- 发送与接收流程都在整个文件流程成功或失败后调用 reader/writer 的 `close()`；句柄随文件处理结束释放。
 
 ---
 
@@ -158,8 +158,8 @@ Go `handleServerSignal`：SIGINT/SIGTERM → `stopTransferringFiles(false)`（`c
 2. ✅ **P0 完成** — 发送源提前 EOF、接收空 DATA chunk 均返回错误；拒绝负长度和超过 SIZE 的数据，避免零进展循环。
 3. ✅ **P0 完成** — `recv_check` 安全处理空载荷、冒号位置及非 UTF-8 输入；按期望类型重同步，并剥离 tmux 状态行。保留 release `panic = "abort"`，通过输入校验避免已知传输路径 panic。
 4. ✅ **P1 完成** — `effective_directory()` 接入 `trz`/`tsz`；tmux/Windows binary 降级实际生效；普通 tmux CFG 发送 `tmux_output_junk`。
-5. ⏳ **P1 待处理** — 创建文件/目录应用 `perm|0600` / `perm|0700`；`delete_created_files` 兼容普通文件；关闭文件句柄；接通 `on_step`。
-6. ⏳ **P1 待处理** — Ctrl+C 接入 `stop_transferring_files`（需给 buffer 加 stop channel）。
+5. ✅ **P1 完成** — 接收权限按 `perm|0600` / `perm|0700` 创建；stop/delete 删除普通文件和目录；文件读写流程在成功/失败路径 close；`on_step` 按 chunk 接入发送/接收并连到 CLI 进度条。
+6. ✅ **P1 完成** — Ctrl+C handler 设置 buffer 共享 stop 状态；buffer 以短间隔轮询，使无传输超时的等待也可中止；保留停止但不删除与停止并删除语义。
 7. ⏳ **P2 待处理** — V2 流水线 + zstd（让 `-c` 生效）→ V3 断点续传 → V4 archive → 隧道/fork。
 
 ---

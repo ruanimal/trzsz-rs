@@ -22,10 +22,14 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::comm::{TrzszError, err_interrupted, err_receive_data_timeout, err_stopped};
+
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub struct TrzszBuffer {
     sender: SyncSender<Vec<u8>>,
@@ -35,6 +39,7 @@ pub struct TrzszBuffer {
     read_buf: Vec<u8>,
     timeout: Option<Instant>,
     new_timeout: Option<Option<Instant>>,
+    stopped: Arc<AtomicBool>,
 }
 
 impl TrzszBuffer {
@@ -48,7 +53,20 @@ impl TrzszBuffer {
             read_buf: Vec::new(),
             timeout: None,
             new_timeout: None,
+            stopped: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    pub fn stop_handle(&self) -> Arc<AtomicBool> {
+        self.stopped.clone()
     }
 
     pub fn sender(&self) -> SyncSender<Vec<u8>> {
@@ -68,6 +86,9 @@ impl TrzszBuffer {
     }
 
     pub fn next_buffer(&mut self) -> Result<Vec<u8>, TrzszError> {
+        if self.is_stopped() {
+            return Err(err_stopped());
+        }
         if let Some(ref buf) = self.next_buf {
             if self.next_idx < buf.len() {
                 // Return remaining slice without clearing next_buf, so the
@@ -80,36 +101,42 @@ impl TrzszBuffer {
         self.next_idx = 0;
 
         loop {
-            if let Some(timeout) = self.timeout {
-                match self
-                    .receiver
-                    .recv_timeout(timeout.duration_since(Instant::now()))
-                {
-                    Ok(buf) => {
-                        self.next_buf = Some(buf.clone());
-                        self.next_idx = 0;
-                        return Ok(buf);
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
+            if self.is_stopped() {
+                return Err(err_stopped());
+            }
+            let wait = match self.timeout {
+                Some(timeout) => {
+                    let remaining = timeout.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
                         if let Some(new_timeout) = self.new_timeout.take() {
                             self.timeout = new_timeout;
                             continue;
                         }
                         return Err(err_receive_data_timeout());
                     }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err(err_stopped());
+                    remaining.min(STOP_POLL_INTERVAL)
+                }
+                None => STOP_POLL_INTERVAL,
+            };
+            match self.receiver.recv_timeout(wait) {
+                Ok(buf) => {
+                    self.next_buf = Some(buf.clone());
+                    self.next_idx = 0;
+                    return Ok(buf);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if self
+                        .timeout
+                        .is_some_and(|timeout| Instant::now() >= timeout)
+                    {
+                        if let Some(new_timeout) = self.new_timeout.take() {
+                            self.timeout = new_timeout;
+                            continue;
+                        }
+                        return Err(err_receive_data_timeout());
                     }
                 }
-            } else {
-                return match self.receiver.recv() {
-                    Ok(buf) => {
-                        self.next_buf = Some(buf.clone());
-                        self.next_idx = 0;
-                        Ok(buf)
-                    }
-                    Err(_) => Err(err_stopped()),
-                };
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(err_stopped()),
             }
         }
     }

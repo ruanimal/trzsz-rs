@@ -23,11 +23,13 @@ SOFTWARE.
 */
 
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use crate::args::TrzArgs;
 use crate::comm::{self, TrzszError, check_path_writable, format_saved_files};
 use crate::escape::get_escape_chars;
+use crate::progress::{ProgressCallback, TextProgressBar};
 use crate::transfer::TrzszTransfer;
 use crate::version::TRZSZ_VERSION;
 
@@ -173,15 +175,35 @@ pub fn trz_main(args: &TrzArgs) -> i32 {
     });
 
     // Handle signals
-    let stopped = std::sync::Arc::new(AtomicBool::new(false));
-    let stopped_clone = stopped.clone();
+    let stop_handle = transfer.stop_handle();
     ctrlc::set_handler(move || {
-        stopped_clone.store(true, Ordering::SeqCst);
+        stop_handle.store(true, Ordering::SeqCst);
     })
     .ok();
 
+    let mut progress = if args.base.quiet {
+        None
+    } else {
+        let writer: Arc<Mutex<dyn Write + Send>> = Arc::new(Mutex::new(io::stderr()));
+        Some(TextProgressBar::new(
+            writer,
+            comm::get_terminal_columns(),
+            tmux_pane_width,
+            "",
+        ))
+    };
+
     // Run recv files
-    let result = recv_files(&mut transfer, &args, tmux_mode, tmux_pane_width);
+    let result = recv_files(
+        &mut transfer,
+        &args,
+        tmux_mode,
+        tmux_pane_width,
+        &mut progress,
+    );
+    if let Some(ref progress) = progress {
+        progress.show_cursor();
+    }
 
     match result {
         Ok(_msg) => 0,
@@ -197,6 +219,7 @@ fn recv_files(
     args: &TrzArgs,
     tmux_mode: comm::TmuxMode,
     tmux_pane_width: i32,
+    progress: &mut Option<TextProgressBar>,
 ) -> Result<String, TrzszError> {
     let action = transfer.recv_action()?;
     if !action.confirm {
@@ -257,7 +280,10 @@ fn recv_files(
             .unwrap_or(crate::comm::CompressType::Auto),
     )?;
 
-    let local_names = transfer.recv_files(&args.path, &mut None)?;
+    let mut callback = progress
+        .as_mut()
+        .map(|bar| bar as &mut dyn ProgressCallback);
+    let local_names = transfer.recv_files(&args.path, &mut callback)?;
 
     transfer.recv_exit()?;
     let msg = format_saved_files(&local_names, &args.path);

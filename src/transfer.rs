@@ -23,8 +23,8 @@ SOFTWARE.
 */
 
 use std::collections::HashMap;
-use std::fs;
-use std::io::Write;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::Path;
 #[cfg(not(target_has_atomic = "64"))]
 use std::sync::Mutex;
@@ -247,23 +247,21 @@ impl TrzszTransfer {
     }
 
     pub fn stop_transferring_files(&self, stop_and_delete: bool) {
-        if !self
-            .stopped
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            return;
-        }
         self.stop_and_delete
-            .store(stop_and_delete, Ordering::Relaxed);
-        // Signal buffer to stop
+            .store(stop_and_delete, Ordering::SeqCst);
+        self.stopped.store(true, Ordering::SeqCst);
+        self.buffer.stop();
+    }
+
+    pub(crate) fn stop_handle(&self) -> std::sync::Arc<AtomicBool> {
+        self.buffer.stop_handle()
     }
 
     pub fn check_stop(&self) -> Result<(), TrzszError> {
-        if self.stop_and_delete.load(Ordering::Relaxed) {
+        if self.stop_and_delete.load(Ordering::SeqCst) {
             return Err(crate::comm::err_stopped_and_deleted());
         }
-        if self.stopped.load(Ordering::Relaxed) {
+        if self.stopped.load(Ordering::SeqCst) || self.buffer.is_stopped() {
             return Err(err_stopped());
         }
         Ok(())
@@ -688,10 +686,14 @@ impl TrzszTransfer {
     pub fn delete_created_files(&mut self) -> Vec<String> {
         let mut deleted = Vec::new();
         for path in &self.created_files {
-            if Path::new(path).exists() {
-                if fs::remove_dir_all(path).is_ok() {
-                    deleted.push(path.clone());
-                }
+            let path = Path::new(path);
+            let removed = match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir_all(path),
+                Ok(_) => fs::remove_file(path),
+                Err(_) => continue,
+            };
+            if removed.is_ok() {
+                deleted.push(path.to_string_lossy().into_owned());
             }
         }
         deleted
@@ -718,7 +720,7 @@ impl TrzszTransfer {
     pub fn server_error(&mut self, err: &TrzszError) {
         self.clean_input(self.clean_timeout);
 
-        if err.is_stop_and_delete() {
+        if self.stop_and_delete.load(Ordering::SeqCst) || err.is_stop_and_delete() {
             let deleted = self.delete_created_files();
             if !deleted.is_empty() {
                 self.server_exit(&crate::comm::join_file_names(&err.message, &deleted));
@@ -774,6 +776,14 @@ impl TrzszTransfer {
     }
 
     pub fn send_file_data(&mut self, file: &mut dyn FileReader) -> Result<Vec<u8>, TrzszError> {
+        self.send_file_data_with_progress(file, &mut None)
+    }
+
+    fn send_file_data_with_progress(
+        &mut self,
+        file: &mut dyn FileReader,
+        progress: &mut Option<&mut dyn ProgressCallback>,
+    ) -> Result<Vec<u8>, TrzszError> {
         let mut step: i64 = 0;
         let mut buf_size: usize = 1024;
         let mut buffer = vec![0u8; buf_size];
@@ -810,6 +820,9 @@ impl TrzszTransfer {
             hasher.update(data);
             self.check_integer(length, self.get_new_timeout())?;
             step += length;
+            if let Some(p) = progress.as_mut() {
+                p.on_step(step);
+            }
             let chunk_time = begin_time.elapsed();
             if length == buf_size as i64
                 && chunk_time < Duration::from_millis(500)
@@ -838,28 +851,31 @@ impl TrzszTransfer {
         progress: &mut Option<&mut dyn ProgressCallback>,
     ) -> Result<Vec<String>, TrzszError> {
         self.send_file_num(source_files.len() as i64)?;
-        if let Some(p) = progress {
+        if let Some(p) = progress.as_mut() {
             p.on_num(source_files.len() as i64);
         }
         let mut remote_names = Vec::new();
         for src_file in source_files {
             let (file_opt, remote_name) = self.send_file_name(src_file)?;
-            if let Some(p) = progress {
+            if let Some(p) = progress.as_mut() {
                 p.on_name(src_file.get_file_name());
             }
             if !remote_names.contains(&remote_name) {
                 remote_names.push(remote_name.clone());
             }
             if let Some(mut file) = file_opt {
-                self.send_file_size(file.size())?;
-                if let Some(p) = progress {
-                    p.on_size(file.size());
-                }
-                let digest = self.send_file_data(&mut *file)?;
-                self.send_file_md5(&digest)?;
-                if let Some(p) = progress {
-                    p.on_done();
-                }
+                with_closed_file_reader(&mut *file, |file| {
+                    self.send_file_size(file.size())?;
+                    if let Some(p) = progress.as_mut() {
+                        p.on_size(file.size());
+                    }
+                    let digest = self.send_file_data_with_progress(file, progress)?;
+                    self.send_file_md5(&digest)?;
+                    if let Some(p) = progress.as_mut() {
+                        p.on_done();
+                    }
+                    Ok(())
+                })?;
             }
         }
         Ok(remote_names)
@@ -876,7 +892,7 @@ impl TrzszTransfer {
         path: &Path,
     ) -> Result<(Option<Box<dyn FileWriter>>, String), TrzszError> {
         let file_name = self.recv_string("NAME", false, self.get_new_timeout())?;
-        let (file, local_name) = if self.transfer_config.directory {
+        let (mut file, local_name) = if self.transfer_config.directory {
             let src_file: SourceFile =
                 serde_json::from_str(&file_name).map_err(|e| TrzszError {
                     message: e.to_string(),
@@ -888,7 +904,12 @@ impl TrzszTransfer {
         } else {
             self.create_file(path, &file_name)?
         };
-        self.send_string("SUCC", &local_name)?;
+        if let Err(error) = self.send_string("SUCC", &local_name) {
+            if let Some(file) = file.as_mut() {
+                let _ = close_file_writer(&mut **file);
+            }
+            return Err(error);
+        }
         Ok((file, local_name))
     }
 
@@ -905,6 +926,15 @@ impl TrzszTransfer {
         &mut self,
         file: &mut dyn FileWriter,
         size: i64,
+    ) -> Result<Vec<u8>, TrzszError> {
+        self.recv_file_data_with_progress(file, size, &mut None)
+    }
+
+    fn recv_file_data_with_progress(
+        &mut self,
+        file: &mut dyn FileWriter,
+        size: i64,
+        progress: &mut Option<&mut dyn ProgressCallback>,
     ) -> Result<Vec<u8>, TrzszError> {
         if size < 0 {
             return Err(crate::comm::simple_error("Invalid file size"));
@@ -934,6 +964,9 @@ impl TrzszTransfer {
             step += length;
             self.send_integer("SUCC", length)?;
             hasher.update(&data);
+            if let Some(p) = progress.as_mut() {
+                p.on_step(step);
+            }
             self.set_last_chunk_time(begin_time.elapsed());
         }
         Ok(hasher.finalize().to_vec())
@@ -954,28 +987,31 @@ impl TrzszTransfer {
         progress: &mut Option<&mut dyn ProgressCallback>,
     ) -> Result<Vec<String>, TrzszError> {
         let num = self.recv_file_num()?;
-        if let Some(p) = progress {
+        if let Some(p) = progress.as_mut() {
             p.on_num(num);
         }
         let mut local_names = Vec::new();
         for _ in 0..num {
             let (file_opt, local_name) = self.recv_file_name(path)?;
-            if let Some(p) = progress {
+            if let Some(p) = progress.as_mut() {
                 p.on_name(&local_name);
             }
             if !local_names.contains(&local_name) {
                 local_names.push(local_name.clone());
             }
             if let Some(mut file) = file_opt {
-                let size = self.recv_file_size()?;
-                if let Some(p) = progress {
-                    p.on_size(size);
-                }
-                let digest = self.recv_file_data(&mut *file, size)?;
-                self.recv_file_md5(&digest)?;
-                if let Some(p) = progress {
-                    p.on_done();
-                }
+                with_closed_file_writer(&mut *file, |file| {
+                    let size = self.recv_file_size()?;
+                    if let Some(p) = progress.as_mut() {
+                        p.on_size(size);
+                    }
+                    let digest = self.recv_file_data_with_progress(file, size, progress)?;
+                    self.recv_file_md5(&digest)?;
+                    if let Some(p) = progress.as_mut() {
+                        p.on_done();
+                    }
+                    Ok(())
+                })?;
             }
         }
         Ok(local_names)
@@ -1013,14 +1049,12 @@ impl TrzszTransfer {
         }
         let local_name = if self.transfer_config.overwrite {
             src_file.rel_path[0].clone()
+        } else if let Some(v) = self.file_name_map.get(&src_file.path_id) {
+            v.clone()
         } else {
-            if let Some(v) = self.file_name_map.get(&src_file.path_id) {
-                v.clone()
-            } else {
-                let name = get_new_name(path, &src_file.rel_path[0])?;
-                self.file_name_map.insert(src_file.path_id, name.clone());
-                name
-            }
+            let name = get_new_name(path, &src_file.rel_path[0])?;
+            self.file_name_map.insert(src_file.path_id, name.clone());
+            name
         };
 
         if src_file.is_dir {
@@ -1030,11 +1064,13 @@ impl TrzszTransfer {
             } else {
                 path.join(&local_name)
             };
-            fs::create_dir_all(&full_path).map_err(|e| TrzszError {
-                message: e.to_string(),
-                err_type: String::new(),
-                trace: false,
-            })?;
+            create_dir_all_with_mode(&full_path, src_file.perm.unwrap_or(0) | 0o700).map_err(
+                |e| TrzszError {
+                    message: e.to_string(),
+                    err_type: String::new(),
+                    trace: false,
+                },
+            )?;
             self.add_created_files(full_path.to_str().unwrap_or(""));
             return Ok((None, local_name));
         }
@@ -1045,7 +1081,7 @@ impl TrzszTransfer {
                 .map(|s| s.as_str())
                 .collect();
             let dir = path.join(&local_name).join(parts.join("/"));
-            fs::create_dir_all(&dir).map_err(|e| TrzszError {
+            create_dir_all_with_mode(&dir, 0o700).map_err(|e| TrzszError {
                 message: e.to_string(),
                 err_type: String::new(),
                 trace: false,
@@ -1055,11 +1091,14 @@ impl TrzszTransfer {
             path.join(&local_name)
         };
 
-        let file = fs::File::create(&full_path).map_err(|e| TrzszError {
-            message: format!("Create file [{}] failed: {}", full_path.display(), e),
-            err_type: String::new(),
-            trace: false,
-        })?;
+        let file =
+            create_file_with_mode(&full_path, src_file.perm.unwrap_or(0) | 0o600).map_err(|e| {
+                TrzszError {
+                    message: format!("Create file [{}] failed: {}", full_path.display(), e),
+                    err_type: String::new(),
+                    trace: false,
+                }
+            })?;
         self.add_created_files(full_path.to_str().unwrap_or(""));
         Ok((Some(Box::new(SimpleFileWriter { file })), local_name))
     }
@@ -1071,6 +1110,71 @@ impl TrzszTransfer {
             ((idx + 1) % K_LAST_CHUNK_TIME_COUNT) as u32,
             Ordering::Relaxed,
         );
+    }
+}
+
+fn create_file_with_mode(path: &Path, mode: u32) -> io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode & 0o777);
+    }
+    options.open(path)
+}
+
+#[cfg(unix)]
+fn create_dir_all_with_mode(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(mode & 0o777).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_dir_all_with_mode(path: &Path, _mode: u32) -> io::Result<()> {
+    fs::create_dir_all(path)
+}
+
+fn close_file_reader(file: &mut dyn FileReader) -> Result<(), TrzszError> {
+    file.close().map_err(|e| TrzszError {
+        message: e.to_string(),
+        err_type: String::new(),
+        trace: false,
+    })
+}
+
+fn with_closed_file_reader<T>(
+    file: &mut dyn FileReader,
+    operation: impl FnOnce(&mut dyn FileReader) -> Result<T, TrzszError>,
+) -> Result<T, TrzszError> {
+    let result = operation(file);
+    let close_result = close_file_reader(file);
+    match (result, close_result) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
+    }
+}
+
+fn close_file_writer(file: &mut dyn FileWriter) -> Result<(), TrzszError> {
+    file.close().map_err(|e| TrzszError {
+        message: e.to_string(),
+        err_type: String::new(),
+        trace: false,
+    })
+}
+
+fn with_closed_file_writer<T>(
+    file: &mut dyn FileWriter,
+    operation: impl FnOnce(&mut dyn FileWriter) -> Result<T, TrzszError>,
+) -> Result<T, TrzszError> {
+    let result = operation(file);
+    let close_result = close_file_writer(file);
+    match (result, close_result) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
     }
 }
 
@@ -1093,5 +1197,35 @@ mod tests {
         assert_eq!(config.timeout, 20);
         assert_eq!(config.newline, "\n");
         assert_eq!(config.bufsize, 10 * 1024 * 1024);
+    }
+
+    struct TrackingWriter(std::sync::Arc<AtomicBool>);
+
+    impl FileWriter for TrackingWriter {
+        fn write_all(&mut self, _buf: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn close(&mut self) -> io::Result<()> {
+            self.0.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn file_writer_is_closed_after_success_and_failure() {
+        for should_fail in [false, true] {
+            let closed = std::sync::Arc::new(AtomicBool::new(false));
+            let mut file = TrackingWriter(closed.clone());
+            let result = with_closed_file_writer(&mut file, |_| {
+                if should_fail {
+                    Err(crate::comm::simple_error("transfer failed"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(result.is_err(), should_fail);
+            assert!(closed.load(Ordering::SeqCst));
+        }
     }
 }

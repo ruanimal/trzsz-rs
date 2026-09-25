@@ -286,7 +286,7 @@ fn check_path_readable_recursive(
     #[cfg(unix)]
     let perm = {
         use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() as u32
+        metadata.permissions().mode() as u32 & 0o777
     };
     #[cfg(not(unix))]
     let perm = 0u32;
@@ -621,7 +621,8 @@ impl FileWriter for SimpleFileWriter {
         self.file.write_all(buf)
     }
     fn close(&mut self) -> io::Result<()> {
-        self.file.sync_all()
+        // The transfer-owned writer drops immediately after close returns.
+        Ok(())
     }
 }
 
@@ -645,7 +646,8 @@ impl FileReader for SimpleFileReader {
         self.file_size
     }
     fn close(&mut self) -> io::Result<()> {
-        self.file.sync_all()
+        // The transfer-owned reader drops immediately after close returns.
+        Ok(())
     }
 }
 

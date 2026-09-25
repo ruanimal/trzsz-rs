@@ -23,10 +23,12 @@ SOFTWARE.
 */
 
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use crate::args::TszArgs;
 use crate::comm::{self, TrzszError, check_duplicate_names, check_paths_readable};
+use crate::progress::{ProgressCallback, TextProgressBar};
 use crate::transfer::TrzszTransfer;
 use crate::version::TRZSZ_VERSION;
 
@@ -163,15 +165,36 @@ pub fn tsz_main(args: &TszArgs) -> i32 {
     });
 
     // Handle signals
-    let stopped = std::sync::Arc::new(AtomicBool::new(false));
-    let stopped_clone = stopped.clone();
+    let stop_handle = transfer.stop_handle();
     ctrlc::set_handler(move || {
-        stopped_clone.store(true, Ordering::SeqCst);
+        stop_handle.store(true, Ordering::SeqCst);
     })
     .ok();
 
+    let mut progress = if args.base.quiet {
+        None
+    } else {
+        let writer: Arc<Mutex<dyn Write + Send>> = Arc::new(Mutex::new(io::stderr()));
+        Some(TextProgressBar::new(
+            writer,
+            comm::get_terminal_columns(),
+            tmux_pane_width,
+            "",
+        ))
+    };
+
     // Run send files
-    let result = send_files(&mut transfer, &files, &args, tmux_mode, tmux_pane_width);
+    let result = send_files(
+        &mut transfer,
+        &files,
+        &args,
+        tmux_mode,
+        tmux_pane_width,
+        &mut progress,
+    );
+    if let Some(ref progress) = progress {
+        progress.show_cursor();
+    }
 
     match result {
         Ok(_msg) => 0,
@@ -188,6 +211,7 @@ fn send_files(
     args: &TszArgs,
     tmux_mode: comm::TmuxMode,
     tmux_pane_width: i32,
+    progress: &mut Option<TextProgressBar>,
 ) -> Result<String, TrzszError> {
     let action = transfer.recv_action()?;
     if !action.confirm {
@@ -232,7 +256,10 @@ fn send_files(
             .unwrap_or(crate::comm::CompressType::Auto),
     )?;
 
-    let _remote_names = transfer.send_files(files, &mut None)?;
+    let mut callback = progress
+        .as_mut()
+        .map(|bar| bar as &mut dyn ProgressCallback);
+    let _remote_names = transfer.send_files(files, &mut callback)?;
 
     let msg = transfer.recv_exit()?;
     transfer.server_exit(&msg);

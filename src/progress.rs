@@ -471,4 +471,35 @@ mod tests {
         assert_eq!(s, "hello...");
         assert_eq!(w, 8);
     }
+
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn text_progress_bar_renders_intermediate_and_completed_steps() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer: Arc<Mutex<dyn Write + Send>> =
+            Arc::new(Mutex::new(CaptureWriter(output.clone())));
+        let mut bar = TextProgressBar::new(writer, 100, 0, "");
+        bar.on_num(1);
+        bar.on_name("sample.bin");
+        bar.on_size(10);
+        bar.on_step(5);
+        bar.on_done();
+
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("sample.bin"));
+        assert!(output.contains("50%"));
+        assert!(output.contains("100%"));
+    }
 }
