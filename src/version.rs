@@ -42,7 +42,11 @@ impl TrzszVersion {
         let minor = parts[1].parse::<u32>().ok()?;
         if parts.len() == 3 {
             let patch = parts[2].parse::<u32>().ok()?;
-            Some(TrzszVersion { major, minor, patch })
+            Some(TrzszVersion {
+                major,
+                minor,
+                patch,
+            })
         } else {
             // Go code requires exactly 3 parts (e.g. "1.0" is invalid)
             None
@@ -56,7 +60,13 @@ impl TrzszVersion {
     pub fn compare(&self, other: &TrzszVersion) -> i32 {
         let a = (self.major as i64) << 32 | (self.minor as i64) << 16 | (self.patch as i64);
         let b = (other.major as i64) << 32 | (other.minor as i64) << 16 | (other.patch as i64);
-        if a < b { -1 } else if a > b { 1 } else { 0 }
+        if a < b {
+            -1
+        } else if a > b {
+            1
+        } else {
+            0
+        }
     }
 }
 
@@ -66,9 +76,30 @@ mod tests {
 
     #[test]
     fn test_parse_version() {
-        assert_eq!(TrzszVersion::parse("1.2.3"), Some(TrzszVersion { major: 1, minor: 2, patch: 3 }));
-        assert_eq!(TrzszVersion::parse("1.0.0"), Some(TrzszVersion { major: 1, minor: 0, patch: 0 }));
-        assert_eq!(TrzszVersion::parse("0.0.0"), Some(TrzszVersion { major: 0, minor: 0, patch: 0 }));
+        assert_eq!(
+            TrzszVersion::parse("1.2.3"),
+            Some(TrzszVersion {
+                major: 1,
+                minor: 2,
+                patch: 3
+            })
+        );
+        assert_eq!(
+            TrzszVersion::parse("1.0.0"),
+            Some(TrzszVersion {
+                major: 1,
+                minor: 0,
+                patch: 0
+            })
+        );
+        assert_eq!(
+            TrzszVersion::parse("0.0.0"),
+            Some(TrzszVersion {
+                major: 0,
+                minor: 0,
+                patch: 0
+            })
+        );
         assert_eq!(TrzszVersion::parse("1"), None);
         assert_eq!(TrzszVersion::parse("1."), None);
         assert_eq!(TrzszVersion::parse("1.0"), None); // Go requires 3 parts
@@ -78,8 +109,42 @@ mod tests {
 
     #[test]
     fn test_compare_version() {
-        assert!(TrzszVersion { major: 2, minor: 1, patch: 1 }.compare(&TrzszVersion { major: 1, minor: 1, patch: 2 }) > 0);
-        assert_eq!(TrzszVersion { major: 3, minor: 2, patch: 1 }.compare(&TrzszVersion { major: 3, minor: 2, patch: 1 }), 0);
-        assert!(TrzszVersion { major: 1, minor: 1, patch: 1 }.compare(&TrzszVersion { major: 1, minor: 2, patch: 0 }) < 0);
+        assert!(
+            TrzszVersion {
+                major: 2,
+                minor: 1,
+                patch: 1
+            }
+            .compare(&TrzszVersion {
+                major: 1,
+                minor: 1,
+                patch: 2
+            }) > 0
+        );
+        assert_eq!(
+            TrzszVersion {
+                major: 3,
+                minor: 2,
+                patch: 1
+            }
+            .compare(&TrzszVersion {
+                major: 3,
+                minor: 2,
+                patch: 1
+            }),
+            0
+        );
+        assert!(
+            TrzszVersion {
+                major: 1,
+                minor: 1,
+                patch: 1
+            }
+            .compare(&TrzszVersion {
+                major: 1,
+                minor: 2,
+                patch: 0
+            }) < 0
+        );
     }
 }

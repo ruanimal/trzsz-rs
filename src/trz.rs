@@ -26,10 +26,7 @@ use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::args::TrzArgs;
-use crate::comm::{
-    self, check_path_writable, format_saved_files,
-    TrzszError,
-};
+use crate::comm::{self, TrzszError, check_path_writable, format_saved_files};
 use crate::escape::get_escape_chars;
 use crate::transfer::TrzszTransfer;
 use crate::version::TRZSZ_VERSION;
@@ -43,11 +40,16 @@ struct RawModeGuard {
 #[cfg(unix)]
 impl RawModeGuard {
     fn enter(fd: std::os::unix::io::RawFd) -> Option<Self> {
-        use nix::sys::termios::{tcgetattr, tcsetattr, SetArg};
+        use nix::sys::termios::{SetArg, tcgetattr, tcsetattr};
         let saved = tcgetattr(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }).ok()?;
         let mut raw = saved.clone();
         nix::sys::termios::cfmakeraw(&mut raw);
-        tcsetattr(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }, SetArg::TCSANOW, &raw).ok()?;
+        tcsetattr(
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
+            SetArg::TCSANOW,
+            &raw,
+        )
+        .ok()?;
         Some(RawModeGuard { fd, saved })
     }
 }
@@ -55,7 +57,7 @@ impl RawModeGuard {
 #[cfg(unix)]
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        use nix::sys::termios::{tcsetattr, SetArg};
+        use nix::sys::termios::{SetArg, tcsetattr};
         let _ = tcsetattr(
             unsafe { std::os::fd::BorrowedFd::borrow_raw(self.fd) },
             SetArg::TCSANOW,
@@ -84,7 +86,11 @@ pub fn trz_main(args: &TrzArgs) -> i32 {
     let path = match std::fs::canonicalize(&path) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("Get absolute path of [{}] failed: {}", args.path.display(), e);
+            eprintln!(
+                "Get absolute path of [{}] failed: {}",
+                args.path.display(),
+                e
+            );
             return -1;
         }
     };
@@ -115,10 +121,14 @@ pub fn trz_main(args: &TrzArgs) -> i32 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
-        % 10_000_000_000) * 100;
+        % 10_000_000_000)
+        * 100;
 
     let mode = if args.base.directory { "D" } else { "R" };
-    let header = format!("\x1b[s::TRZSZ:TRANSFER:{}:{}:{:013}:0\r\n", mode, TRZSZ_VERSION, unique_id);
+    let header = format!(
+        "\x1b[s::TRZSZ:TRANSFER:{}:{}:{:013}:0\r\n",
+        mode, TRZSZ_VERSION, unique_id
+    );
     let _ = io::stdout().write_all(header.as_bytes());
     let _ = io::stdout().flush();
 
@@ -132,7 +142,11 @@ pub fn trz_main(args: &TrzArgs) -> i32 {
 
     // Setup transfer
     let mut transfer = TrzszTransfer::new(Box::new(io::stdout()));
-    transfer.transfer_config.bufsize = args.base.parse_bufsize().map(|b| b.size).unwrap_or(10 * 1024 * 1024);
+    transfer.transfer_config.bufsize = args
+        .base
+        .parse_bufsize()
+        .map(|b| b.size)
+        .unwrap_or(10 * 1024 * 1024);
     transfer.transfer_config.timeout = args.base.timeout;
 
     // Wrap stdin reader
@@ -159,7 +173,8 @@ pub fn trz_main(args: &TrzArgs) -> i32 {
     let stopped_clone = stopped.clone();
     ctrlc::set_handler(move || {
         stopped_clone.store(true, Ordering::SeqCst);
-    }).ok();
+    })
+    .ok();
 
     // Run recv files
     let result = recv_files(&mut transfer, &args, tmux_mode, tmux_pane_width);
@@ -191,11 +206,15 @@ fn recv_files(
     }
 
     if args.base.fork && !action.fork {
-        return Err(comm::simple_error("The client doesn't support fork to background"));
+        return Err(comm::simple_error(
+            "The client doesn't support fork to background",
+        ));
     }
 
     if args.base.directory && !action.support_directory {
-        return Err(comm::simple_error("The client doesn't support transfer directory"));
+        return Err(comm::simple_error(
+            "The client doesn't support transfer directory",
+        ));
     }
 
     let escape_chars = if binary {
@@ -203,10 +222,18 @@ fn recv_files(
     } else {
         vec![]
     };
-    let escape_value = serde_json::to_value(&escape_chars.iter().map(|(a, b)| {
-        vec![serde_json::Value::String(String::from_utf8_lossy(a).to_string()),
-             serde_json::Value::String(String::from_utf8_lossy(b).to_string())]
-    }).collect::<Vec<_>>()).unwrap_or(serde_json::Value::Null);
+    let escape_value = serde_json::to_value(
+        &escape_chars
+            .iter()
+            .map(|(a, b)| {
+                vec![
+                    serde_json::Value::String(String::from_utf8_lossy(a).to_string()),
+                    serde_json::Value::String(String::from_utf8_lossy(b).to_string()),
+                ]
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or(serde_json::Value::Null);
 
     transfer.transfer_config.binary = binary;
     transfer.send_config(
@@ -217,7 +244,9 @@ fn recv_files(
         &escape_value,
         _tmux_pane_width,
         &action,
-        args.base.parse_compress().unwrap_or(crate::comm::CompressType::Auto),
+        args.base
+            .parse_compress()
+            .unwrap_or(crate::comm::CompressType::Auto),
     )?;
 
     let local_names = transfer.recv_files(&args.path, &mut None)?;
@@ -233,9 +262,7 @@ mod tests {
     #[test]
     fn test_trz_main_help() {
         // Just verify it doesn't panic when args are invalid
-        let result = std::process::Command::new("echo")
-            .arg("test")
-            .output();
+        let result = std::process::Command::new("echo").arg("test").output();
         assert!(result.is_ok());
     }
 }

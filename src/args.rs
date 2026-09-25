@@ -391,7 +391,10 @@ mod tests {
         let args = TszArgs::try_parse_from(["tsz", "-y", "-d", "a", "b", "c"]).unwrap();
         assert!(args.base.overwrite);
         assert!(args.base.directory);
-        assert_eq!(args.file, vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")]);
+        assert_eq!(
+            args.file,
+            vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")]
+        );
     }
 
     #[test]

@@ -47,7 +47,7 @@ pub fn trzsz_main(args: &TrzszArgs) -> i32 {
         use std::io::Write;
         let mut out = std::io::stdout();
         let _ = out.write_all(b"\x1b[?25h"); // show cursor
-        let _ = out.write_all(b"\x1b[0m");   // reset attributes
+        let _ = out.write_all(b"\x1b[0m"); // reset attributes
         let _ = out.flush();
     });
 
@@ -95,7 +95,8 @@ pub fn trzsz_main(args: &TrzszArgs) -> i32 {
         let stopped_clone = stopped.clone();
         ctrlc::set_handler(move || {
             stopped_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-        }).ok();
+        })
+        .ok();
     } else {
         // New trzsz filter
         let columns = get_terminal_columns();
@@ -120,7 +121,8 @@ pub fn trzsz_main(args: &TrzszArgs) -> i32 {
         let stopped_clone = stopped.clone();
         ctrlc::set_handler(move || {
             stopped_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-        }).ok();
+        })
+        .ok();
     }
 
     // Wait for child process
@@ -142,7 +144,16 @@ fn get_terminal_columns() -> i32 {
 
 /// Spawn a pseudo-terminal and run the command.
 #[cfg(feature = "pty")]
-fn spawn_pty(args: &[String]) -> Result<(Box<dyn Write + Send>, Box<dyn Read + Send>, Box<dyn Child + Send>), TrzszError> {
+fn spawn_pty(
+    args: &[String],
+) -> Result<
+    (
+        Box<dyn Write + Send>,
+        Box<dyn Read + Send>,
+        Box<dyn Child + Send>,
+    ),
+    TrzszError,
+> {
     let cmd = &args[0];
     let cmd_args = &args[1..];
 
@@ -155,31 +166,50 @@ fn spawn_pty(args: &[String]) -> Result<(Box<dyn Write + Send>, Box<dyn Read + S
         pixel_width: 0,
         pixel_height: 0,
     };
-    let pty_pair = pty_system.openpty(pty_size).map_err(|e| {
-        comm::simple_trzsz_error("Open PTY failed", e)
-    })?;
+    let pty_pair = pty_system
+        .openpty(pty_size)
+        .map_err(|e| comm::simple_trzsz_error("Open PTY failed", e))?;
 
     let mut cmd_builder = CommandBuilder::new(cmd);
     cmd_builder.args(cmd_args);
 
-    let child = pty_pair.slave.spawn_command(cmd_builder).map_err(|e| {
-        comm::simple_trzsz_error("Spawn command on PTY failed", e)
-    })?;
+    let child = pty_pair
+        .slave
+        .spawn_command(cmd_builder)
+        .map_err(|e| comm::simple_trzsz_error("Spawn command on PTY failed", e))?;
 
     // The master side is the pty handle for reading/writing
-    let reader = pty_pair.master.try_clone_reader().map_err(|e| {
-        comm::simple_trzsz_error("Clone PTY reader failed", e)
-    })?;
-    let writer = pty_pair.master.take_writer().map_err(|e| {
-        comm::simple_trzsz_error("Take PTY writer failed", e)
-    })?;
+    let reader = pty_pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| comm::simple_trzsz_error("Clone PTY reader failed", e))?;
+    let writer = pty_pair
+        .master
+        .take_writer()
+        .map_err(|e| comm::simple_trzsz_error("Take PTY writer failed", e))?;
 
-    Ok((Box::new(writer), Box::new(reader), Box::new(PtyChild { child, _pty_pair: pty_pair })))
+    Ok((
+        Box::new(writer),
+        Box::new(reader),
+        Box::new(PtyChild {
+            child,
+            _pty_pair: pty_pair,
+        }),
+    ))
 }
 
 /// Fallback when pty feature is disabled (no portable_pty support on this target).
 #[cfg(not(feature = "pty"))]
-fn spawn_pty_fallback(args: &[String]) -> Result<(Box<dyn Write + Send>, Box<dyn Read + Send>, Box<dyn Child + Send>), TrzszError> {
+fn spawn_pty_fallback(
+    args: &[String],
+) -> Result<
+    (
+        Box<dyn Write + Send>,
+        Box<dyn Read + Send>,
+        Box<dyn Child + Send>,
+    ),
+    TrzszError,
+> {
     use std::process::Command;
 
     let cmd = &args[0];
@@ -191,16 +221,16 @@ fn spawn_pty_fallback(args: &[String]) -> Result<(Box<dyn Write + Send>, Box<dyn
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .spawn()
-        .map_err(|e| {
-            comm::simple_trzsz_error("Spawn command failed", e)
-        })?;
+        .map_err(|e| comm::simple_trzsz_error("Spawn command failed", e))?;
 
-    let stdin = child.stdin.take().ok_or_else(|| {
-        comm::simple_trzsz_error("Take stdin failed", "No stdin")
-    })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        comm::simple_trzsz_error("Take stdout failed", "No stdout")
-    })?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| comm::simple_trzsz_error("Take stdin failed", "No stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| comm::simple_trzsz_error("Take stdout failed", "No stdout"))?;
 
     Ok((Box::new(stdin), Box::new(stdout), Box::new(child)))
 }
@@ -214,9 +244,10 @@ struct PtyChild {
 #[cfg(feature = "pty")]
 impl Child for PtyChild {
     fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
-        let status = self.child.wait().map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, e)
-        })?;
+        let status = self
+            .child
+            .wait()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         // portable_pty ExitStatus wraps the process ExitStatus
         // Convert via exit_code() -> from_raw
         #[cfg(unix)]

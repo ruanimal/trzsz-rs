@@ -124,21 +124,17 @@ pub fn simple_error(format: &str) -> TrzszError {
     }
 }
 
-pub static ERR_STOPPED: std::sync::LazyLock<TrzszError> = std::sync::LazyLock::new(|| {
-    simple_error("Stopped")
-});
+pub static ERR_STOPPED: std::sync::LazyLock<TrzszError> =
+    std::sync::LazyLock::new(|| simple_error("Stopped"));
 
-pub static ERR_STOPPED_AND_DELETED: std::sync::LazyLock<TrzszError> = std::sync::LazyLock::new(|| {
-    simple_error("Stopped and deleted")
-});
+pub static ERR_STOPPED_AND_DELETED: std::sync::LazyLock<TrzszError> =
+    std::sync::LazyLock::new(|| simple_error("Stopped and deleted"));
 
-pub static ERR_RECEIVE_DATA_TIMEOUT: std::sync::LazyLock<TrzszError> = std::sync::LazyLock::new(|| {
-    simple_error("Receive data timeout")
-});
+pub static ERR_RECEIVE_DATA_TIMEOUT: std::sync::LazyLock<TrzszError> =
+    std::sync::LazyLock::new(|| simple_error("Receive data timeout"));
 
-pub static ERR_INTERRUPTED: std::sync::LazyLock<TrzszError> = std::sync::LazyLock::new(|| {
-    simple_error("Interrupted")
-});
+pub static ERR_INTERRUPTED: std::sync::LazyLock<TrzszError> =
+    std::sync::LazyLock::new(|| simple_error("Interrupted"));
 
 pub fn err_stopped() -> TrzszError {
     simple_error("Stopped")
@@ -248,9 +244,8 @@ pub fn check_paths_readable(
 ) -> Result<Vec<SourceFile>, TrzszError> {
     let mut list = Vec::new();
     for (i, p) in paths.iter().enumerate() {
-        let abs_path = fs::canonicalize(p).map_err(|e| {
-            simple_trzsz_error(&format!("Canonicalize [{}] error", p.display()), e)
-        })?;
+        let abs_path = fs::canonicalize(p)
+            .map_err(|e| simple_trzsz_error(&format!("Canonicalize [{}] error", p.display()), e))?;
         let metadata = fs::metadata(&abs_path).map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
                 simple_trzsz_error("No such file", abs_path.display())
@@ -312,9 +307,8 @@ fn check_path_readable_recursive(
         return Ok(());
     }
 
-    let real_path = fs::canonicalize(path).map_err(|e| {
-        simple_trzsz_error(&format!("EvalSymlinks [{}] error", path.display()), e)
-    })?;
+    let real_path = fs::canonicalize(path)
+        .map_err(|e| simple_trzsz_error(&format!("EvalSymlinks [{}] error", path.display()), e))?;
     if !visited.insert(real_path.clone()) {
         return Err(simple_trzsz_error("Duplicate link", path.display()));
     }
@@ -329,13 +323,10 @@ fn check_path_readable_recursive(
         perm: Some(perm),
     });
 
-    let entries = fs::read_dir(path).map_err(|e| {
-        simple_trzsz_error(&format!("Readdir [{}] error", path.display()), e)
-    })?;
+    let entries = fs::read_dir(path)
+        .map_err(|e| simple_trzsz_error(&format!("Readdir [{}] error", path.display()), e))?;
     for entry in entries {
-        let entry = entry.map_err(|e| {
-            simple_trzsz_error(&format!("ReadDir entry error"), e)
-        })?;
+        let entry = entry.map_err(|e| simple_trzsz_error(&format!("ReadDir entry error"), e))?;
         let file_name = entry.file_name().to_string_lossy().to_string();
         let child_path = entry.path();
         let child_meta = fs::metadata(&child_path).map_err(|e| {
@@ -392,7 +383,11 @@ pub fn check_tmux() -> Result<(TmuxMode, Option<String>, i32), TrzszError> {
     }
 
     let output = std::process::Command::new("tmux")
-        .args(["display-message", "-p", "#{client_tty}:#{client_control_mode}:#{pane_width}"])
+        .args([
+            "display-message",
+            "-p",
+            "#{client_tty}:#{client_control_mode}:#{pane_width}",
+        ])
         .output()
         .map_err(|e| simple_trzsz_error("Get tmux output failed", e))?;
 
@@ -408,9 +403,9 @@ pub fn check_tmux() -> Result<(TmuxMode, Option<String>, i32), TrzszError> {
     let pane_width_str = tokens[2];
 
     let tmux_pane_width = if !pane_width_str.is_empty() {
-        pane_width_str.parse::<i32>().map_err(|e| {
-            simple_trzsz_error("Parse tmux pane width failed", e)
-        })?
+        pane_width_str
+            .parse::<i32>()
+            .map_err(|e| simple_trzsz_error("Parse tmux pane width failed", e))?
     } else {
         -1
     };
@@ -423,7 +418,11 @@ pub fn check_tmux() -> Result<(TmuxMode, Option<String>, i32), TrzszError> {
         return Ok((TmuxMode::Control, None, tmux_pane_width));
     }
 
-    Ok((TmuxMode::Normal, Some(tmux_tty.to_string()), tmux_pane_width))
+    Ok((
+        TmuxMode::Normal,
+        Some(tmux_tty.to_string()),
+        tmux_pane_width,
+    ))
 }
 
 pub fn get_terminal_columns() -> i32 {
@@ -489,7 +488,11 @@ pub fn format_saved_files(names: &[String], path: &Path) -> String {
         return "No file saved".to_string();
     }
     let count = names.len();
-    let plural = if count > 1 { "files/directories" } else { "file/directory" };
+    let plural = if count > 1 {
+        "files/directories"
+    } else {
+        "file/directory"
+    };
     let mut result = format!("Saved {} {}", count, plural);
     let display_path = path.to_string_lossy();
     if !display_path.is_empty() {
@@ -557,10 +560,11 @@ impl BufferSize {
         if s.is_empty() {
             return Err(simple_trzsz_error("Invalid size", s));
         }
-        let (num_part, unit_part) = s.split_at(
-            s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()),
-        );
-        let size_value = num_part.parse::<i64>().map_err(|_| simple_trzsz_error("Invalid size", s))?;
+        let (num_part, unit_part) =
+            s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+        let size_value = num_part
+            .parse::<i64>()
+            .map_err(|_| simple_trzsz_error("Invalid size", s))?;
         let size = match unit_part.to_lowercase().as_str() {
             "" | "b" => size_value,
             "k" | "kb" => size_value * 1024,
@@ -580,7 +584,9 @@ impl BufferSize {
 
 impl Default for BufferSize {
     fn default() -> Self {
-        BufferSize { size: 10 * 1024 * 1024 }
+        BufferSize {
+            size: 10 * 1024 * 1024,
+        }
     }
 }
 
@@ -690,7 +696,7 @@ pub fn listen_for_tunnel() -> (Option<std::net::TcpListener>, i32) {
 
 #[cfg(unix)]
 pub fn fork_to_background() -> Result<bool, TrzszError> {
-    use nix::unistd::{fork, ForkResult};
+    use nix::unistd::{ForkResult, fork};
     match unsafe { fork() } {
         Ok(ForkResult::Parent { .. }) => Ok(true),
         Ok(ForkResult::Child) => {
@@ -704,7 +710,9 @@ pub fn fork_to_background() -> Result<bool, TrzszError> {
 
 #[cfg(not(unix))]
 pub fn fork_to_background() -> Result<bool, TrzszError> {
-    Err(simple_error("Fork to background is not supported on this platform"))
+    Err(simple_error(
+        "Fork to background is not supported on this platform",
+    ))
 }
 
 // ─── Running on tmux ───────────────────────────────────────────────────────
@@ -730,7 +738,10 @@ mod tests {
         assert_eq!(BufferSize::parse("1GB").unwrap().size, 1024 * 1024 * 1024);
         assert_eq!(BufferSize::parse("2K").unwrap().size, 2 * 1024);
         assert_eq!(BufferSize::parse("10").unwrap_err().message, "Less than 1K");
-        assert_eq!(BufferSize::parse("2GB").unwrap_err().message, "Greater than 1G");
+        assert_eq!(
+            BufferSize::parse("2GB").unwrap_err().message,
+            "Greater than 1G"
+        );
     }
 
     #[test]
@@ -767,11 +778,17 @@ mod tests {
         assert_eq!(format_saved_files(&[], dir.path()), "No file saved");
         assert_eq!(
             format_saved_files(&["foo.txt".to_string()], dir.path()),
-            format!("Saved 1 file/directory to {}\r\n- foo.txt", dir.path().display())
+            format!(
+                "Saved 1 file/directory to {}\r\n- foo.txt",
+                dir.path().display()
+            )
         );
         assert_eq!(
             format_saved_files(&["a.txt".to_string(), "b.txt".to_string()], dir.path()),
-            format!("Saved 2 files/directories to {}\r\n- a.txt\r\n- b.txt", dir.path().display())
+            format!(
+                "Saved 2 files/directories to {}\r\n- a.txt\r\n- b.txt",
+                dir.path().display()
+            )
         );
     }
 }

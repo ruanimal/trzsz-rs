@@ -155,28 +155,35 @@ impl TrzszFilter {
         if let Some(idx) = output.find(marker) {
             let rest = &output[idx + marker.len()..];
             let end_markers = ['\n', '\r'];
-            let end = rest.find(|c: char| end_markers.contains(&c)).unwrap_or(rest.len());
+            let end = rest
+                .find(|c: char| end_markers.contains(&c))
+                .unwrap_or(rest.len());
             let trigger_str = &rest[..end];
             let parts: Vec<&str> = trigger_str.split(':').collect();
             if parts.len() >= 3 {
                 let mode = parts[0].chars().next().unwrap_or(' ');
                 let version = TrzszVersion::parse(parts[1]);
                 let unique_id = parts[2].to_string();
-                let win_server = unique_id.ends_with('0') || unique_id.ends_with('2') || unique_id.ends_with("10");
+                let win_server = unique_id.ends_with('0')
+                    || unique_id.ends_with('2')
+                    || unique_id.ends_with("10");
                 let tunnel_port = if parts.len() > 3 {
                     parts[3].parse::<i32>().unwrap_or(0)
                 } else {
                     0
                 };
-                return (buf.to_vec(), Some(TrzszTrigger {
-                    mode,
-                    version,
-                    unique_id,
-                    win_server,
-                    tunnel_port,
-                    tmux_prefix: String::new(),
-                    tmux_pane_id: String::new(),
-                }));
+                return (
+                    buf.to_vec(),
+                    Some(TrzszTrigger {
+                        mode,
+                        version,
+                        unique_id,
+                        win_server,
+                        tunnel_port,
+                        tmux_prefix: String::new(),
+                        tmux_pane_id: String::new(),
+                    }),
+                );
             }
         }
         (buf.to_vec(), None)
@@ -194,7 +201,14 @@ mod tests {
         assert!(trigger.is_some());
         let t = trigger.unwrap();
         assert_eq!(t.mode, 'S');
-        assert_eq!(t.version, Some(TrzszVersion { major: 1, minor: 2, patch: 0 }));
+        assert_eq!(
+            t.version,
+            Some(TrzszVersion {
+                major: 1,
+                minor: 2,
+                patch: 0
+            })
+        );
         assert_eq!(t.unique_id, "1234567890123");
     }
 

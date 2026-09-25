@@ -22,10 +22,10 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-use std::sync::mpsc::{self, SyncSender, Receiver};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::Instant;
 
-use crate::comm::{err_interrupted, err_receive_data_timeout, err_stopped, TrzszError};
+use crate::comm::{TrzszError, err_interrupted, err_receive_data_timeout, err_stopped};
 
 pub struct TrzszBuffer {
     sender: SyncSender<Vec<u8>>,
@@ -81,7 +81,10 @@ impl TrzszBuffer {
 
         loop {
             if let Some(timeout) = self.timeout {
-                match self.receiver.recv_timeout(timeout.duration_since(Instant::now())) {
+                match self
+                    .receiver
+                    .recv_timeout(timeout.duration_since(Instant::now()))
+                {
                     Ok(buf) => {
                         self.next_buf = Some(buf.clone());
                         self.next_idx = 0;
@@ -111,7 +114,11 @@ impl TrzszBuffer {
         }
     }
 
-    pub fn read_line(&mut self, may_has_junk: bool, timeout: Option<Instant>) -> Result<Vec<u8>, TrzszError> {
+    pub fn read_line(
+        &mut self,
+        may_has_junk: bool,
+        timeout: Option<Instant>,
+    ) -> Result<Vec<u8>, TrzszError> {
         self.read_buf.clear();
         self.timeout = timeout;
         self.new_timeout = None;
@@ -125,7 +132,8 @@ impl TrzszBuffer {
                 // returned `buf` is a slice starting at the original next_idx.
                 self.next_idx += idx + 1;
                 let line = &buf[..idx];
-                if may_has_junk && !self.read_buf.is_empty() && self.read_buf.last() == Some(&b'\r') {
+                if may_has_junk && !self.read_buf.is_empty() && self.read_buf.last() == Some(&b'\r')
+                {
                     self.read_buf.truncate(self.read_buf.len() - 1);
                     self.read_buf.extend_from_slice(line);
                     continue;
@@ -147,7 +155,11 @@ impl TrzszBuffer {
         }
     }
 
-    pub fn read_binary(&mut self, size: usize, timeout: Option<Instant>) -> Result<Vec<u8>, TrzszError> {
+    pub fn read_binary(
+        &mut self,
+        size: usize,
+        timeout: Option<Instant>,
+    ) -> Result<Vec<u8>, TrzszError> {
         self.read_buf.clear();
         self.read_buf.reserve(size);
         self.timeout = timeout;
@@ -166,7 +178,10 @@ impl TrzszBuffer {
         Ok(self.read_buf.clone())
     }
 
-    pub fn read_line_on_windows(&mut self, timeout: Option<Instant>) -> Result<Vec<u8>, TrzszError> {
+    pub fn read_line_on_windows(
+        &mut self,
+        timeout: Option<Instant>,
+    ) -> Result<Vec<u8>, TrzszError> {
         self.read_buf.clear();
         self.timeout = timeout;
         self.new_timeout = None;

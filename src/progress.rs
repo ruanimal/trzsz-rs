@@ -167,11 +167,7 @@ impl RecentSpeed {
             self.speed_idx = 0;
         }
 
-        if speed.is_nan() {
-            -1.0
-        } else {
-            speed
-        }
+        if speed.is_nan() { -1.0 } else { speed }
     }
 }
 
@@ -196,7 +192,12 @@ pub struct TextProgressBar {
 }
 
 impl TextProgressBar {
-    pub fn new(writer: Arc<Mutex<dyn Write + Send>>, columns: i32, tmux_pane_columns: i32, tmux_prefix: &str) -> Self {
+    pub fn new(
+        writer: Arc<Mutex<dyn Write + Send>>,
+        columns: i32,
+        tmux_pane_columns: i32,
+        tmux_prefix: &str,
+    ) -> Self {
         let effective_columns = if tmux_pane_columns > 1 {
             tmux_pane_columns - 1
         } else {
@@ -262,7 +263,10 @@ impl TextProgressBar {
         let percentage = if self.file_size == 0 {
             "100%".to_string()
         } else {
-            format!("{:.0}%", (self.file_step as f64 * 100.0 / self.file_size as f64).round())
+            format!(
+                "{:.0}%",
+                (self.file_step as f64 * 100.0 / self.file_size as f64).round()
+            )
         };
         let total = convert_size_to_string(self.file_step as f64);
         let speed = self.recent_speed.get_speed(self.file_step, now);
@@ -321,23 +325,32 @@ impl TextProgressBar {
                 }
                 if cols.saturating_sub(left_length).saturating_sub(right.len()) < BAR_MIN_LENGTH {
                     right = format!(" {} | {} | {}", percentage, speed, eta);
-                    if cols.saturating_sub(left_length).saturating_sub(right.len()) < BAR_MIN_LENGTH {
+                    if cols.saturating_sub(left_length).saturating_sub(right.len()) < BAR_MIN_LENGTH
+                    {
                         if left_length > 30 {
                             let (s, l) = get_ellipsis_string(&left, 30);
                             left = s;
                             left_length = l;
                         }
-                        if cols.saturating_sub(left_length).saturating_sub(right.len()) < BAR_MIN_LENGTH {
+                        if cols.saturating_sub(left_length).saturating_sub(right.len())
+                            < BAR_MIN_LENGTH
+                        {
                             right = format!(" {} | {}", percentage, eta);
-                            if cols.saturating_sub(left_length).saturating_sub(right.len()) < BAR_MIN_LENGTH {
+                            if cols.saturating_sub(left_length).saturating_sub(right.len())
+                                < BAR_MIN_LENGTH
+                            {
                                 right = format!(" {}", percentage);
-                                if cols.saturating_sub(left_length).saturating_sub(right.len()) < BAR_MIN_LENGTH {
+                                if cols.saturating_sub(left_length).saturating_sub(right.len())
+                                    < BAR_MIN_LENGTH
+                                {
                                     if left_length > 20 {
                                         let (s, l) = get_ellipsis_string(&left, 20);
                                         left = s;
                                         left_length = l;
                                     }
-                                    if cols.saturating_sub(left_length).saturating_sub(right.len()) < BAR_MIN_LENGTH {
+                                    if cols.saturating_sub(left_length).saturating_sub(right.len())
+                                        < BAR_MIN_LENGTH
+                                    {
                                         left.clear();
                                         left_length = 0;
                                     }
@@ -349,7 +362,9 @@ impl TextProgressBar {
             }
         }
 
-        let bar_length = cols.saturating_sub(right.len()).saturating_sub(if left_length > 0 { left_length + 1 } else { 0 });
+        let bar_length = cols
+            .saturating_sub(right.len())
+            .saturating_sub(if left_length > 0 { left_length + 1 } else { 0 });
         let bar = self.get_progress_bar(bar_length);
 
         let result = if left_length > 0 {

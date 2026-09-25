@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 const DOWNLOAD_DIR: &str = "/tmp/trzsz_dl";
 
@@ -55,7 +55,12 @@ fn test_go_filter_downloads_from_go_tsz() {
 
     let pty_system = native_pty_system();
     let pair = pty_system
-        .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .expect("openpty");
 
     let mut cmd = CommandBuilder::new(&go_trzsz);
@@ -72,7 +77,9 @@ fn test_go_filter_downloads_from_go_tsz() {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         while let Ok(n) = reader.read(&mut buf) {
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             output_clone.lock().unwrap().extend_from_slice(&buf[..n]);
         }
     });

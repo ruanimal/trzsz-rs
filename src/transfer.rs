@@ -26,26 +26,25 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-#[cfg(target_has_atomic = "64")]
-use std::sync::atomic::AtomicI64;
-use std::sync::mpsc;
 #[cfg(not(target_has_atomic = "64"))]
 use std::sync::Mutex;
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use sha2::Digest;
 use md5::Md5;
+use sha2::Digest;
 
 use crate::buffer::TrzszBuffer;
 use crate::comm::{
-    CompressType, FileWriter, FileReader, SimpleFileReader, SimpleFileWriter,
-    SourceFile, TrzszError, err_stopped,
-    get_new_name, write_all,
+    CompressType, FileReader, FileWriter, SimpleFileReader, SimpleFileWriter, SourceFile,
+    TrzszError, err_stopped, get_new_name, write_all,
 };
 use crate::escape::{self, EscapeTable};
-use crate::version::{TRZSZ_VERSION, TrzszVersion};
 use crate::progress::ProgressCallback;
+use crate::version::{TRZSZ_VERSION, TrzszVersion};
 
 pub const K_PROTOCOL_VERSION2: i32 = 2;
 pub const K_PROTOCOL_VERSION3: i32 = 3;
@@ -101,9 +100,15 @@ impl Default for TransferAction {
     }
 }
 
-fn default_lang() -> String { "go".to_string() }
-fn default_true() -> bool { true }
-fn default_newline() -> String { "\n".to_string() }
+fn default_lang() -> String {
+    "go".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_newline() -> String {
+    "\n".to_string()
+}
 
 // ─── Transfer Config ───────────────────────────────────────────────────────
 
@@ -157,8 +162,12 @@ impl Default for TransferConfig {
     }
 }
 
-fn default_timeout() -> i32 { 20 }
-fn default_bufsize() -> i64 { 10 * 1024 * 1024 }
+fn default_timeout() -> i32 {
+    20
+}
+fn default_bufsize() -> i64 {
+    10 * 1024 * 1024
+}
 
 // ─── TrzszTransfer ─────────────────────────────────────────────────────────
 
@@ -238,10 +247,15 @@ impl TrzszTransfer {
     }
 
     pub fn stop_transferring_files(&self, stop_and_delete: bool) {
-        if !self.stopped.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        if !self
+            .stopped
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
             return;
         }
-        self.stop_and_delete.store(stop_and_delete, Ordering::Relaxed);
+        self.stop_and_delete
+            .store(stop_and_delete, Ordering::Relaxed);
         // Signal buffer to stop
     }
 
@@ -269,33 +283,53 @@ impl TrzszTransfer {
     }
 
     pub fn write_all(&mut self, buf: &[u8]) -> Result<(), TrzszError> {
-        write_all(&mut self.writer, buf).map_err(|e| {
-            TrzszError { message: e.to_string(), err_type: String::new(), trace: false }
+        write_all(&mut self.writer, buf).map_err(|e| TrzszError {
+            message: e.to_string(),
+            err_type: String::new(),
+            trace: false,
         })?;
         // Flush after every write to prevent the OS-level stdout buffer from
         // delaying transfer data. Without this, the receiver may wait forever
         // for chunks that are still sitting in the local stdout buffer.
-        self.writer.flush().map_err(|e| {
-            TrzszError { message: e.to_string(), err_type: String::new(), trace: false }
+        self.writer.flush().map_err(|e| TrzszError {
+            message: e.to_string(),
+            err_type: String::new(),
+            trace: false,
         })
     }
 
-    pub fn recv_line(&mut self, _expect_type: &str, may_has_junk: bool, timeout: Option<Instant>) -> Result<Vec<u8>, TrzszError> {
+    pub fn recv_line(
+        &mut self,
+        _expect_type: &str,
+        may_has_junk: bool,
+        timeout: Option<Instant>,
+    ) -> Result<Vec<u8>, TrzszError> {
         self.check_stop()?;
         let line = self.buffer.read_line(may_has_junk, timeout)?;
         Ok(line)
     }
 
-    pub fn recv_check(&mut self, expect_type: &str, may_has_junk: bool, timeout: Option<Instant>) -> Result<String, TrzszError> {
+    pub fn recv_check(
+        &mut self,
+        expect_type: &str,
+        may_has_junk: bool,
+        timeout: Option<Instant>,
+    ) -> Result<String, TrzszError> {
         let line = self.recv_line(expect_type, may_has_junk, timeout)?;
         let line_str = String::from_utf8_lossy(&line);
-        let idx = line_str.find(':').ok_or_else(|| {
-            TrzszError { message: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &line), err_type: "colon".to_string(), trace: true }
+        let idx = line_str.find(':').ok_or_else(|| TrzszError {
+            message: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &line),
+            err_type: "colon".to_string(),
+            trace: true,
         })?;
         let typ = &line_str[1..idx];
         let buf = &line_str[idx + 1..];
         if typ != expect_type {
-            return Err(TrzszError { message: buf.to_string(), err_type: typ.to_string(), trace: true });
+            return Err(TrzszError {
+                message: buf.to_string(),
+                err_type: typ.to_string(),
+                trace: true,
+            });
         }
         Ok(buf.to_string())
     }
@@ -304,14 +338,25 @@ impl TrzszTransfer {
         self.send_line(typ, &val.to_string())
     }
 
-    pub fn recv_integer(&mut self, typ: &str, may_has_junk: bool, timeout: Option<Instant>) -> Result<i64, TrzszError> {
+    pub fn recv_integer(
+        &mut self,
+        typ: &str,
+        may_has_junk: bool,
+        timeout: Option<Instant>,
+    ) -> Result<i64, TrzszError> {
         let buf = self.recv_check(typ, may_has_junk, timeout)?;
-        buf.parse::<i64>().map_err(|e| {
-            TrzszError { message: e.to_string(), err_type: String::new(), trace: false }
+        buf.parse::<i64>().map_err(|e| TrzszError {
+            message: e.to_string(),
+            err_type: String::new(),
+            trace: false,
         })
     }
 
-    pub fn check_integer(&mut self, expect: i64, timeout: Option<Instant>) -> Result<(), TrzszError> {
+    pub fn check_integer(
+        &mut self,
+        expect: i64,
+        timeout: Option<Instant>,
+    ) -> Result<(), TrzszError> {
         let result = self.recv_integer("SUCC", false, timeout)?;
         if result != expect {
             return Err(TrzszError {
@@ -328,11 +373,18 @@ impl TrzszTransfer {
         self.send_line(typ, &encoded)
     }
 
-    pub fn recv_string(&mut self, typ: &str, may_has_junk: bool, timeout: Option<Instant>) -> Result<String, TrzszError> {
+    pub fn recv_string(
+        &mut self,
+        typ: &str,
+        may_has_junk: bool,
+        timeout: Option<Instant>,
+    ) -> Result<String, TrzszError> {
         let buf = self.recv_check(typ, may_has_junk, timeout)?;
         let decoded = escape::decode_string(&buf)?;
-        String::from_utf8(decoded).map_err(|e| {
-            TrzszError { message: e.to_string(), err_type: String::new(), trace: false }
+        String::from_utf8(decoded).map_err(|e| TrzszError {
+            message: e.to_string(),
+            err_type: String::new(),
+            trace: false,
         })
     }
 
@@ -341,18 +393,29 @@ impl TrzszTransfer {
         self.send_line(typ, &encoded)
     }
 
-    pub fn recv_binary(&mut self, typ: &str, may_has_junk: bool, timeout: Option<Instant>) -> Result<Vec<u8>, TrzszError> {
+    pub fn recv_binary(
+        &mut self,
+        typ: &str,
+        may_has_junk: bool,
+        timeout: Option<Instant>,
+    ) -> Result<Vec<u8>, TrzszError> {
         let buf = self.recv_check(typ, may_has_junk, timeout)?;
         escape::decode_string(&buf)
     }
 
-    pub fn check_binary(&mut self, expect: &[u8], timeout: Option<Instant>) -> Result<(), TrzszError> {
+    pub fn check_binary(
+        &mut self,
+        expect: &[u8],
+        timeout: Option<Instant>,
+    ) -> Result<(), TrzszError> {
         let result = self.recv_binary("SUCC", false, timeout)?;
         if result != expect {
             return Err(TrzszError {
-                message: format!("Binary check [{}] <> [{}]",
+                message: format!(
+                    "Binary check [{}] <> [{}]",
                     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &result),
-                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, expect)),
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, expect)
+                ),
                 err_type: String::new(),
                 trace: true,
             });
@@ -401,11 +464,24 @@ impl TrzszTransfer {
         }
     }
 
-    pub fn send_action(&mut self, confirm: bool, server_version: Option<&TrzszVersion>, remote_is_windows: bool) -> Result<(), TrzszError> {
+    pub fn send_action(
+        &mut self,
+        confirm: bool,
+        server_version: Option<&TrzszVersion>,
+        remote_is_windows: bool,
+    ) -> Result<(), TrzszError> {
         let mut protocol = K_PROTOCOL_VERSION;
         if let Some(ver) = server_version {
-            let v113 = TrzszVersion { major: 1, minor: 1, patch: 3 };
-            let v110 = TrzszVersion { major: 1, minor: 0, patch: 0 };
+            let v113 = TrzszVersion {
+                major: 1,
+                minor: 1,
+                patch: 3,
+            };
+            let v110 = TrzszVersion {
+                major: 1,
+                minor: 0,
+                patch: 0,
+            };
             if ver.compare(&v113) <= 0 && ver.compare(&v110) >= 0 {
                 protocol = 2;
             }
@@ -421,8 +497,10 @@ impl TrzszTransfer {
             ..Default::default()
         };
 
-        let act_str = serde_json::to_string(&action).map_err(|e| {
-            TrzszError { message: e.to_string(), err_type: String::new(), trace: false }
+        let act_str = serde_json::to_string(&action).map_err(|e| TrzszError {
+            message: e.to_string(),
+            err_type: String::new(),
+            trace: false,
         })?;
 
         if remote_is_windows {
@@ -434,9 +512,12 @@ impl TrzszTransfer {
 
     pub fn recv_action(&mut self) -> Result<TransferAction, TrzszError> {
         let act_str = self.recv_string("ACT", true, None)?;
-        let mut action: TransferAction = serde_json::from_str(&act_str).map_err(|e| {
-            TrzszError { message: e.to_string(), err_type: String::new(), trace: false }
-        })?;
+        let mut action: TransferAction =
+            serde_json::from_str(&act_str).map_err(|e| TrzszError {
+                message: e.to_string(),
+                err_type: String::new(),
+                trace: false,
+            })?;
         if action.newline.is_empty() {
             action.newline = "\n".to_string();
         }
@@ -444,9 +525,17 @@ impl TrzszTransfer {
         Ok(action)
     }
 
-    pub fn send_config(&mut self, quiet: bool, binary: bool, directory: bool, overwrite: bool,
-                        escape_chars: &serde_json::Value, tmux_pane_width: i32,
-                        action: &TransferAction, compress: CompressType) -> Result<(), TrzszError> {
+    pub fn send_config(
+        &mut self,
+        quiet: bool,
+        binary: bool,
+        directory: bool,
+        overwrite: bool,
+        escape_chars: &serde_json::Value,
+        tmux_pane_width: i32,
+        action: &TransferAction,
+        compress: CompressType,
+    ) -> Result<(), TrzszError> {
         let mut cfg_map = serde_json::json!({
             "lang": "rust",
         });
@@ -479,8 +568,10 @@ impl TrzszTransfer {
         }
 
         // Deserialize into TransferConfig
-        self.transfer_config = serde_json::from_value(cfg_map.clone()).map_err(|e| {
-            TrzszError { message: e.to_string(), err_type: String::new(), trace: false }
+        self.transfer_config = serde_json::from_value(cfg_map.clone()).map_err(|e| TrzszError {
+            message: e.to_string(),
+            err_type: String::new(),
+            trace: false,
         })?;
         let cfg_str = serde_json::to_string(&cfg_map).unwrap_or_default();
         self.send_string("CFG", &cfg_str)
@@ -488,8 +579,10 @@ impl TrzszTransfer {
 
     pub fn recv_config(&mut self) -> Result<TransferConfig, TrzszError> {
         let cfg_str = self.recv_string("CFG", true, self.get_new_timeout())?;
-        let config: TransferConfig = serde_json::from_str(&cfg_str).map_err(|e| {
-            TrzszError { message: e.to_string(), err_type: String::new(), trace: false }
+        let config: TransferConfig = serde_json::from_str(&cfg_str).map_err(|e| TrzszError {
+            message: e.to_string(),
+            err_type: String::new(),
+            trace: false,
         })?;
         self.transfer_config = config.clone();
         Ok(config)
@@ -547,7 +640,8 @@ impl TrzszTransfer {
         // Already reset once: just print the green banner at the top of the
         // screen (if not ignorable), then return without touching the saved
         // cursor position again.
-        if self.term_reseted
+        if self
+            .term_reseted
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
@@ -599,7 +693,10 @@ impl TrzszTransfer {
         if self.stop_and_delete.load(Ordering::Relaxed) {
             let deleted = self.delete_created_files();
             if !deleted.is_empty() {
-                let _ = self.send_string("fail", &crate::comm::join_file_names(&err.message, &deleted));
+                let _ = self.send_string(
+                    "fail",
+                    &crate::comm::join_file_names(&err.message, &deleted),
+                );
                 return;
             }
         }
@@ -630,9 +727,16 @@ impl TrzszTransfer {
         Ok(())
     }
 
-    pub fn send_file_name(&mut self, src_file: &SourceFile) -> Result<(Option<Box<dyn FileReader>>, String), TrzszError> {
+    pub fn send_file_name(
+        &mut self,
+        src_file: &SourceFile,
+    ) -> Result<(Option<Box<dyn FileReader>>, String), TrzszError> {
         let file_name = if self.transfer_config.directory {
-            src_file.marshal().map_err(|e| TrzszError { message: e.to_string(), err_type: String::new(), trace: false })?
+            src_file.marshal().map_err(|e| TrzszError {
+                message: e.to_string(),
+                err_type: String::new(),
+                trace: false,
+            })?
         } else {
             src_file.get_file_name().to_string()
         };
@@ -641,10 +745,15 @@ impl TrzszTransfer {
         if src_file.is_dir {
             return Ok((None, remote_name));
         }
-        let file = fs::File::open(&src_file.abs_path).map_err(|e| {
-            TrzszError { message: e.to_string(), err_type: String::new(), trace: false }
+        let file = fs::File::open(&src_file.abs_path).map_err(|e| TrzszError {
+            message: e.to_string(),
+            err_type: String::new(),
+            trace: false,
         })?;
-        let reader: Box<dyn FileReader> = Box::new(SimpleFileReader { file, file_size: src_file.size });
+        let reader: Box<dyn FileReader> = Box::new(SimpleFileReader {
+            file,
+            file_size: src_file.size,
+        });
         Ok((Some(reader), remote_name))
     }
 
@@ -664,10 +773,18 @@ impl TrzszTransfer {
         while step < size {
             let begin_time = Instant::now();
             let m = size - step;
-            let read_size = if (m as usize) < buf_size { m as usize } else { buf_size };
-            let n = file.read(&mut buffer[..read_size]).map_err(|e| {
-                TrzszError { message: e.to_string(), err_type: String::new(), trace: false }
-            })?;
+            let read_size = if (m as usize) < buf_size {
+                m as usize
+            } else {
+                buf_size
+            };
+            let n = file
+                .read(&mut buffer[..read_size])
+                .map_err(|e| TrzszError {
+                    message: e.to_string(),
+                    err_type: String::new(),
+                    trace: false,
+                })?;
             let length = n as i64;
             let data = &buffer[..n];
             self.send_data(data)?;
@@ -675,7 +792,10 @@ impl TrzszTransfer {
             self.check_integer(length, self.get_new_timeout())?;
             step += length;
             let chunk_time = begin_time.elapsed();
-            if length == buf_size as i64 && chunk_time < Duration::from_millis(500) && buf_size < self.transfer_config.bufsize as usize {
+            if length == buf_size as i64
+                && chunk_time < Duration::from_millis(500)
+                && buf_size < self.transfer_config.bufsize as usize
+            {
                 buf_size = (buf_size * 2).min(self.transfer_config.bufsize as usize);
                 buffer.resize(buf_size, 0);
             } else if chunk_time >= Duration::from_secs(2) && buf_size > 1024 {
@@ -693,7 +813,11 @@ impl TrzszTransfer {
         Ok(())
     }
 
-    pub fn send_files(&mut self, source_files: &[SourceFile], progress: &mut Option<&mut dyn ProgressCallback>) -> Result<Vec<String>, TrzszError> {
+    pub fn send_files(
+        &mut self,
+        source_files: &[SourceFile],
+        progress: &mut Option<&mut dyn ProgressCallback>,
+    ) -> Result<Vec<String>, TrzszError> {
         self.send_file_num(source_files.len() as i64)?;
         if let Some(p) = progress {
             p.on_num(source_files.len() as i64);
@@ -728,12 +852,18 @@ impl TrzszTransfer {
         Ok(num)
     }
 
-    pub fn recv_file_name(&mut self, path: &Path) -> Result<(Option<Box<dyn FileWriter>>, String), TrzszError> {
+    pub fn recv_file_name(
+        &mut self,
+        path: &Path,
+    ) -> Result<(Option<Box<dyn FileWriter>>, String), TrzszError> {
         let file_name = self.recv_string("NAME", false, self.get_new_timeout())?;
         let (file, local_name) = if self.transfer_config.directory {
-            let src_file: SourceFile = serde_json::from_str(&file_name).map_err(|e| {
-                TrzszError { message: e.to_string(), err_type: String::new(), trace: false }
-            })?;
+            let src_file: SourceFile =
+                serde_json::from_str(&file_name).map_err(|e| TrzszError {
+                    message: e.to_string(),
+                    err_type: String::new(),
+                    trace: false,
+                })?;
             let (f, ln) = self.create_dir_or_file(path, &src_file)?;
             (f, ln)
         } else {
@@ -749,14 +879,20 @@ impl TrzszTransfer {
         Ok(size)
     }
 
-    pub fn recv_file_data(&mut self, file: &mut dyn FileWriter, size: i64) -> Result<Vec<u8>, TrzszError> {
+    pub fn recv_file_data(
+        &mut self,
+        file: &mut dyn FileWriter,
+        size: i64,
+    ) -> Result<Vec<u8>, TrzszError> {
         let mut step: i64 = 0;
         let mut hasher = Md5::new();
         while step < size {
             let begin_time = Instant::now();
             let data = self.recv_data()?;
-            file.write_all(&data).map_err(|e| {
-                TrzszError { message: e.to_string(), err_type: String::new(), trace: false }
+            file.write_all(&data).map_err(|e| TrzszError {
+                message: e.to_string(),
+                err_type: String::new(),
+                trace: false,
             })?;
             let length = data.len() as i64;
             step += length;
@@ -776,7 +912,11 @@ impl TrzszTransfer {
         Ok(())
     }
 
-    pub fn recv_files(&mut self, path: &Path, progress: &mut Option<&mut dyn ProgressCallback>) -> Result<Vec<String>, TrzszError> {
+    pub fn recv_files(
+        &mut self,
+        path: &Path,
+        progress: &mut Option<&mut dyn ProgressCallback>,
+    ) -> Result<Vec<String>, TrzszError> {
         let num = self.recv_file_num()?;
         if let Some(p) = progress {
             p.on_num(num);
@@ -805,21 +945,31 @@ impl TrzszTransfer {
         Ok(local_names)
     }
 
-    fn create_file(&mut self, path: &Path, name: &str) -> Result<(Option<Box<dyn FileWriter>>, String), TrzszError> {
+    fn create_file(
+        &mut self,
+        path: &Path,
+        name: &str,
+    ) -> Result<(Option<Box<dyn FileWriter>>, String), TrzszError> {
         let local_name = if self.transfer_config.overwrite {
             name.to_string()
         } else {
             get_new_name(path, name)?
         };
         let full_path = path.join(&local_name);
-        let file = fs::File::create(&full_path).map_err(|e| {
-            TrzszError { message: format!("Create file [{}] failed: {}", full_path.display(), e), err_type: String::new(), trace: false }
+        let file = fs::File::create(&full_path).map_err(|e| TrzszError {
+            message: format!("Create file [{}] failed: {}", full_path.display(), e),
+            err_type: String::new(),
+            trace: false,
         })?;
         self.add_created_files(full_path.to_str().unwrap_or(""));
         Ok((Some(Box::new(SimpleFileWriter { file })), local_name))
     }
 
-    fn create_dir_or_file(&mut self, path: &Path, src_file: &SourceFile) -> Result<(Option<Box<dyn FileWriter>>, String), TrzszError> {
+    fn create_dir_or_file(
+        &mut self,
+        path: &Path,
+        src_file: &SourceFile,
+    ) -> Result<(Option<Box<dyn FileWriter>>, String), TrzszError> {
         let local_name = if self.transfer_config.overwrite {
             src_file.rel_path[0].clone()
         } else {
@@ -839,26 +989,35 @@ impl TrzszTransfer {
             } else {
                 path.join(&local_name)
             };
-            fs::create_dir_all(&full_path).map_err(|e| {
-                TrzszError { message: e.to_string(), err_type: String::new(), trace: false }
+            fs::create_dir_all(&full_path).map_err(|e| TrzszError {
+                message: e.to_string(),
+                err_type: String::new(),
+                trace: false,
             })?;
             self.add_created_files(full_path.to_str().unwrap_or(""));
             return Ok((None, local_name));
         }
 
         let full_path = if src_file.rel_path.len() > 1 {
-            let parts: Vec<&str> = src_file.rel_path[1..src_file.rel_path.len()-1].iter().map(|s| s.as_str()).collect();
+            let parts: Vec<&str> = src_file.rel_path[1..src_file.rel_path.len() - 1]
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
             let dir = path.join(&local_name).join(parts.join("/"));
-            fs::create_dir_all(&dir).map_err(|e| {
-                TrzszError { message: e.to_string(), err_type: String::new(), trace: false }
+            fs::create_dir_all(&dir).map_err(|e| TrzszError {
+                message: e.to_string(),
+                err_type: String::new(),
+                trace: false,
             })?;
             dir.join(src_file.get_file_name())
         } else {
             path.join(&local_name)
         };
 
-        let file = fs::File::create(&full_path).map_err(|e| {
-            TrzszError { message: format!("Create file [{}] failed: {}", full_path.display(), e), err_type: String::new(), trace: false }
+        let file = fs::File::create(&full_path).map_err(|e| TrzszError {
+            message: format!("Create file [{}] failed: {}", full_path.display(), e),
+            err_type: String::new(),
+            trace: false,
         })?;
         self.add_created_files(full_path.to_str().unwrap_or(""));
         Ok((Some(Box::new(SimpleFileWriter { file })), local_name))
@@ -867,7 +1026,10 @@ impl TrzszTransfer {
     fn set_last_chunk_time(&mut self, chunk_time: Duration) {
         let idx = self.last_chunk_time_idx.load(Ordering::Relaxed) as usize;
         self.last_chunk_time_arr[idx] = chunk_time;
-        self.last_chunk_time_idx.store(((idx + 1) % K_LAST_CHUNK_TIME_COUNT) as u32, Ordering::Relaxed);
+        self.last_chunk_time_idx.store(
+            ((idx + 1) % K_LAST_CHUNK_TIME_COUNT) as u32,
+            Ordering::Relaxed,
+        );
     }
 }
 

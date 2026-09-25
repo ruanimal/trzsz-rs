@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 const DOWNLOAD_DIR: &str = "/tmp/trzsz_dl";
 
@@ -24,7 +24,10 @@ fn rs_tsz() -> PathBuf {
     p.pop();
     p.push("tsz");
     if !p.exists() {
-        panic!("rs tsz binary not found at {}. Run `cargo build` first.", p.display());
+        panic!(
+            "rs tsz binary not found at {}. Run `cargo build` first.",
+            p.display()
+        );
     }
     p
 }
@@ -98,7 +101,9 @@ fn test_go_filter_downloads_from_rs_tsz() {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         while let Ok(n) = reader.read(&mut buf) {
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             output_clone.lock().unwrap().extend_from_slice(&buf[..n]);
         }
     });
@@ -188,17 +193,25 @@ fn test_rs_tsz_exits_after_transfer() {
     let stdout_thread = std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         while let Ok(n) = stdout.read(&mut buf) {
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             buf_clone.lock().unwrap().extend_from_slice(&buf[..n]);
         }
     });
 
     fn find(buf: &[u8], needle: &[u8]) -> Option<usize> {
-        if buf.len() < needle.len() { return None; }
+        if buf.len() < needle.len() {
+            return None;
+        }
         (0..=buf.len() - needle.len()).find(|&i| &buf[i..i + needle.len()] == needle)
     }
 
-    fn read_line_at(buf: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>, from: usize, timeout: Duration) -> (Vec<u8>, usize) {
+    fn read_line_at(
+        buf: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        from: usize,
+        timeout: Duration,
+    ) -> (Vec<u8>, usize) {
         let deadline = Instant::now() + timeout;
         loop {
             let b = buf.lock().unwrap();
@@ -245,7 +258,8 @@ fn test_rs_tsz_exits_after_transfer() {
     let action_json = serde_json::json!({
         "lang": "go", "version": "1.2.0", "confirm": true,
         "newline": "\n", "protocol": 4, "binary": true, "support_dir": true,
-    }).to_string();
+    })
+    .to_string();
     let act = format!("#ACT:{}\n", trzsz_rs::escape::encode_string(&action_json));
     stdin.write_all(act.as_bytes()).unwrap();
     stdin.flush().unwrap();
@@ -256,20 +270,26 @@ fn test_rs_tsz_exits_after_transfer() {
     let (num, np) = read_line_at(&stdout_buf, pos, Duration::from_secs(3));
     pos = np;
     let (_, val) = parse_typed(&num);
-    stdin.write_all(format!("#SUCC:{}\n", val).as_bytes()).unwrap();
+    stdin
+        .write_all(format!("#SUCC:{}\n", val).as_bytes())
+        .unwrap();
     stdin.flush().unwrap();
 
     let (_name, np) = read_line_at(&stdout_buf, pos, Duration::from_secs(3));
     pos = np;
     let local = trzsz_rs::escape::encode_string("exit_test.txt");
-    stdin.write_all(format!("#SUCC:{}\n", local).as_bytes()).unwrap();
+    stdin
+        .write_all(format!("#SUCC:{}\n", local).as_bytes())
+        .unwrap();
     stdin.flush().unwrap();
 
     let (size_line, np) = read_line_at(&stdout_buf, pos, Duration::from_secs(3));
     pos = np;
     let (_, val) = parse_typed(&size_line);
     let size: usize = val.parse().unwrap();
-    stdin.write_all(format!("#SUCC:{}\n", val).as_bytes()).unwrap();
+    stdin
+        .write_all(format!("#SUCC:{}\n", val).as_bytes())
+        .unwrap();
     stdin.flush().unwrap();
 
     // DATA chunk(s).
@@ -280,19 +300,25 @@ fn test_rs_tsz_exits_after_transfer() {
         let (_, val) = parse_typed(&data);
         let chunk = trzsz_rs::escape::decode_string(&val).expect("decode DATA");
         received += chunk.len();
-        stdin.write_all(format!("#SUCC:{}\n", chunk.len()).as_bytes()).unwrap();
+        stdin
+            .write_all(format!("#SUCC:{}\n", chunk.len()).as_bytes())
+            .unwrap();
         stdin.flush().unwrap();
     }
 
     // MD5.
     let (md5_line, _np) = read_line_at(&stdout_buf, pos, Duration::from_secs(3));
     let (_, val) = parse_typed(&md5_line);
-    stdin.write_all(format!("#SUCC:{}\n", val).as_bytes()).unwrap();
+    stdin
+        .write_all(format!("#SUCC:{}\n", val).as_bytes())
+        .unwrap();
     stdin.flush().unwrap();
 
     // Send EXIT.
     let exit_msg = trzsz_rs::escape::encode_string("done");
-    stdin.write_all(format!("#EXIT:{}\n", exit_msg).as_bytes()).unwrap();
+    stdin
+        .write_all(format!("#EXIT:{}\n", exit_msg).as_bytes())
+        .unwrap();
     stdin.flush().unwrap();
 
     // The process should exit promptly. Allow up to 3 seconds.
@@ -350,7 +376,12 @@ fn test_go_filter_downloads_large_from_rs_tsz() {
 
     let pty_system = native_pty_system();
     let pair = pty_system
-        .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .expect("openpty");
 
     let mut cmd = CommandBuilder::new(&go_trzsz);
@@ -367,7 +398,9 @@ fn test_go_filter_downloads_large_from_rs_tsz() {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         while let Ok(n) = reader.read(&mut buf) {
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             output_clone.lock().unwrap().extend_from_slice(&buf[..n]);
         }
     });

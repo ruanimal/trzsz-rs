@@ -26,10 +26,7 @@ use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::args::TszArgs;
-use crate::comm::{
-    self, check_duplicate_names, check_paths_readable,
-    TrzszError,
-};
+use crate::comm::{self, TrzszError, check_duplicate_names, check_paths_readable};
 use crate::transfer::TrzszTransfer;
 use crate::version::TRZSZ_VERSION;
 
@@ -42,11 +39,16 @@ struct RawModeGuard {
 #[cfg(unix)]
 impl RawModeGuard {
     fn enter(fd: std::os::unix::io::RawFd) -> Option<Self> {
-        use nix::sys::termios::{tcgetattr, tcsetattr, SetArg};
+        use nix::sys::termios::{SetArg, tcgetattr, tcsetattr};
         let saved = tcgetattr(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }).ok()?;
         let mut raw = saved.clone();
         nix::sys::termios::cfmakeraw(&mut raw);
-        tcsetattr(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }, SetArg::TCSANOW, &raw).ok()?;
+        tcsetattr(
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
+            SetArg::TCSANOW,
+            &raw,
+        )
+        .ok()?;
         Some(RawModeGuard { fd, saved })
     }
 }
@@ -54,7 +56,7 @@ impl RawModeGuard {
 #[cfg(unix)]
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        use nix::sys::termios::{tcsetattr, SetArg};
+        use nix::sys::termios::{SetArg, tcsetattr};
         let _ = tcsetattr(
             unsafe { std::os::fd::BorrowedFd::borrow_raw(self.fd) },
             SetArg::TCSANOW,
@@ -112,9 +114,13 @@ pub fn tsz_main(args: &TszArgs) -> i32 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
-        % 10_000_000_000) * 100;
+        % 10_000_000_000)
+        * 100;
 
-    let header = format!("\x1b[s::TRZSZ:TRANSFER:S:{}:{:013}:0\r\n", TRZSZ_VERSION, unique_id);
+    let header = format!(
+        "\x1b[s::TRZSZ:TRANSFER:S:{}:{:013}:0\r\n",
+        TRZSZ_VERSION, unique_id
+    );
     let _ = io::stdout().write_all(header.as_bytes());
     let _ = io::stdout().flush();
 
@@ -130,7 +136,11 @@ pub fn tsz_main(args: &TszArgs) -> i32 {
 
     // Setup transfer
     let mut transfer = TrzszTransfer::new(Box::new(io::stdout()));
-    transfer.transfer_config.bufsize = args.base.parse_bufsize().map(|b| b.size).unwrap_or(10 * 1024 * 1024);
+    transfer.transfer_config.bufsize = args
+        .base
+        .parse_bufsize()
+        .map(|b| b.size)
+        .unwrap_or(10 * 1024 * 1024);
     transfer.transfer_config.timeout = args.base.timeout;
 
     // Wrap stdin reader
@@ -157,7 +167,8 @@ pub fn tsz_main(args: &TszArgs) -> i32 {
     let stopped_clone = stopped.clone();
     ctrlc::set_handler(move || {
         stopped_clone.store(true, Ordering::SeqCst);
-    }).ok();
+    })
+    .ok();
 
     // Run send files
     let result = send_files(&mut transfer, &files, &args, tmux_mode, tmux_pane_width);
@@ -190,11 +201,15 @@ fn send_files(
     }
 
     if args.base.fork && !action.fork {
-        return Err(comm::simple_error("The client doesn't support fork to background"));
+        return Err(comm::simple_error(
+            "The client doesn't support fork to background",
+        ));
     }
 
     if args.base.directory && !action.support_directory {
-        return Err(comm::simple_error("The client doesn't support transfer directory"));
+        return Err(comm::simple_error(
+            "The client doesn't support transfer directory",
+        ));
     }
 
     let escape_value = serde_json::Value::Null;
@@ -208,7 +223,9 @@ fn send_files(
         &escape_value,
         _tmux_pane_width,
         &action,
-        args.base.parse_compress().unwrap_or(crate::comm::CompressType::Auto),
+        args.base
+            .parse_compress()
+            .unwrap_or(crate::comm::CompressType::Auto),
     )?;
 
     let _remote_names = transfer.send_files(files, &mut None)?;
@@ -219,5 +236,4 @@ fn send_files(
 }
 
 #[cfg(test)]
-mod tests {
-}
+mod tests {}
