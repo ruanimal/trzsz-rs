@@ -7,7 +7,7 @@
 - **Roadmap 第 1 步 / 传输 P0：已完成**（实现见提交 `06ab606`）：修复 Latin-1 转义、收发数据零进展、畸形协议行、`-r`、binary 降级及 `tmux_output_junk`。
 - 新增 `tests/transfer_p0.rs`，覆盖 14 个无需 Go 工具链的回归场景；`cargo fmt --check` 与 `cargo test` 已通过。
 - **仍待处理**：权限保留、普通文件删除、文件句柄关闭、实时进度、Ctrl+C 取消，以及协议 V2+ 能力（见第五节）。
-- **真实 Go 互通未验证**：本轮环境缺少 `/tmp/go-trzsz`、`/tmp/go-trz`、`/tmp/go-tsz`；相关互通测试可能静默跳过。
+- **真实 Go 互通已部分验证**：从 `./trzsz-go/cmd` 构建后，`tests/interop.rs` 的 Go filter ↔ Rust `tsz` 小文件及 256 KiB 文件用例通过；另用 Go `TrzszFilter.OneTimeUpload` → Rust `trz -b -e` 验证了含 16 个控制/二进制字节的原样落盘。仓库互通测试仍硬编码 `/tmp/go-*`，缺少这些文件时可能静默跳过。
 
 **范围**：只看 `trz`/`tsz` 与对端之间的文件传输协议与实现，即 `src/transfer.rs`、`src/buffer.rs`、`src/escape.rs`、`src/comm.rs`（路径/校验部分）、`src/progress.rs`、`src/trz.rs`、`src/tsz.rs` 的传输流程。
 **明确排除**：`trzsz` 包装器（ssh/pty/数据泵）、relay、拖拽上传、zmodem、OSC52、文件选择对话框等非传输项。
@@ -18,7 +18,7 @@
 ## 一、实测功能性缺陷及修复状态
 > 以下复现与根因记录的是修复前现象；标题状态及第五节反映当前状态。
 
-### 1. 二进制模式 `-b` 的转义链路【P0 已修复；真实 Go 互通待验证】
+### 1. 二进制模式 `-b` 的转义链路【P0 已修复；Go binary 上传互通已验证】
 
 **线上实测**（`trz -b -e` 发出的 CFG）：
 
@@ -114,9 +114,9 @@ Go `handleServerSignal`：SIGINT/SIGTERM → `stopTransferringFiles(false)`（`c
 | **目录归档** | V4 `archiveSourceFiles` 把同 `path_id` 的多项打包单流（`archive.go:81-94`） | `SourceFile::sub_files()` 恒返回 `&[]`（`comm.rs:643-647`） | 多选目录逐个 NAME/DATA 协商，慢且不原子 |
 | **暂停/恢复** | V3 `#DATA:=` / `pausing`/`pauseIdx`（`pipeline.go:340-406`） | 无 | 无法暂停 |
 | **隧道 + fork 后台** | `listenForTunnel` 发真实端口 + hello 握手 + `switchToBackground`（`comm.go:991-997`、`transfer.go:154-250`） | 端口写死 `0`（`trz.rs:121` / `tsz.rs:117`）、`listen_for_tunnel` 无人调用、`background()` 返回永不触发的 receiver（`transfer.rs:220-224`，且 `transfer.rs:190` 的接收端当场丢弃） | **`-f` 必然失败**："The client doesn't support fork to background" |
-| **tmux 输出脏字节** | tmux 普通模式发送 `tmux_output_junk: true`，对端据此启用 `mayHasJunk` + `stripTmuxStatusLine` | **已修复（M0）**：普通 tmux 模式在 CFG 中发送该键，接收行按类型重同步并剥离 tmux 状态行 | 本地回归覆盖；真实 Go 互通待验证 |
+| **tmux 输出脏字节** | tmux 普通模式发送 `tmux_output_junk: true`，对端据此启用 `mayHasJunk` + `stripTmuxStatusLine` | **已修复（M0）**：普通 tmux 模式在 CFG 中发送该键，接收行按类型重同步并剥离 tmux 状态行 | 本地回归覆盖；真实 tmux 场景待验证 |
 
-协议消息与 JSON 字段定义经源码比对，并由本地协议测试覆盖；本轮缺少 Go 二进制，未验证真实 Go 互通。
+协议消息与 JSON 字段定义经源码比对；真实 Go 互通已验证 base64 下载及 Go filter → Rust `trz -b -e` binary 上传，真实 tmux 场景尚未覆盖。
 
 ---
 
@@ -124,7 +124,7 @@ Go `handleServerSignal`：SIGINT/SIGTERM → `stopTransferringFiles(false)`（`c
 
 | 项 | Go | Rust |
 |---|---|---|
-| `recvLine` 脏数据重同步 | `mayHasJunk` 时 `LastIndex("#TYPE:")`，否则取最后一个 `#`（`transfer.go:422-431`） | **已修复（P0）**：按期望类型重同步；启用 junk 时剥离 tmux 状态行 | 本地回归覆盖；真实 Go 互通待验证 |
+| `recvLine` 脏数据重同步 | `mayHasJunk` 时 `LastIndex("#TYPE:")`，否则取最后一个 `#`（`transfer.go:422-431`） | **已修复（P0）**：按期望类型重同步；启用 junk 时剥离 tmux 状态行 | 本地回归覆盖；真实 tmux junk 场景待验证 |
 | colon 错误载荷 | zlib+base64 编码并加 `[TrzszError] typ:` 前缀，`fail/FAIL/EXIT` 可解（`comm.go:228-248`） | 纯 base64（`transfer.rs:293`），类型不匹配时不解码 → 错误文案乱码 |
 | `\r` 结尾行处理 | append 后检查，若以 `\r` 结尾则截断并继续读（`buffer.go:119-137`） | **append 前**检查 `last()`（`buffer.rs:128-132`）→ 单 chunk `#X:1\r\n` 会留下尾随 `\r` |
 | 空 `path_name` | `unmarshalSourceFile` 返回 "Invalid source file"（`comm.go:320-329`） | **已修复（P0）**：空 `rel_path` 返回明确错误，不再索引访问 | 本地回归覆盖 |
@@ -166,5 +166,5 @@ Go `handleServerSignal`：SIGINT/SIGTERM → `stopTransferringFiles(false)`（`c
 
 ## 附：本报告的实测手段
 
-- 回归覆盖已沉淀在 `tests/transfer_p0.rs`（14 项），包括 Latin-1/binary 转义、早 EOF、畸形行、tmux junk、目录、重名和零字节文件。
-- 这些本地测试不依赖 Go；与真实 Go `trz`/`tsz` 的互通仍需准备 `/tmp/go-*` 二进制后单独验证。
+- 本轮从 `./trzsz-go/cmd` 构建 Go 工具，`tests/interop.rs` 的两项 Go filter ↔ Rust `tsz` 下载用例实际运行并通过；`interop_baseline` 是 Go ↔ Go 基线，不作为 Rust 互通证据。
+- 用 scratch 中的临时 Go probe 调用 `TrzszFilter.OneTimeUpload`，向 Rust `trz -b -e` 上传 16 字节控制/二进制 payload，已逐字节验证一致；probe 未纳入仓库自动测试。
