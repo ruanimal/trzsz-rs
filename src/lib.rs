@@ -32,4 +32,5 @@ pub mod transfer;
 pub mod trz;
 pub mod trzsz;
 pub mod tsz;
+pub(crate) mod v2;
 pub mod version;

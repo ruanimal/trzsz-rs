@@ -144,7 +144,7 @@ fn test_full_handshake_and_data_transfer() {
     // 2. Send ACT
     let action_json = serde_json::json!({
         "lang": "go", "version": "1.2.0", "confirm": true,
-        "newline": "\n", "protocol": 4, "binary": true, "support_dir": true,
+        "newline": "\n", "protocol": 1, "binary": true, "support_dir": true,
     })
     .to_string();
     let act_line = format!("#ACT:{}\n", trzsz_rs::escape::encode_string(&action_json));

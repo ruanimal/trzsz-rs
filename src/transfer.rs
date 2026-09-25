@@ -49,9 +49,9 @@ use crate::version::{TRZSZ_VERSION, TrzszVersion};
 pub const K_PROTOCOL_VERSION2: i32 = 2;
 pub const K_PROTOCOL_VERSION3: i32 = 3;
 pub const K_PROTOCOL_VERSION4: i32 = 4;
-// Use protocol version 1 for now: V2+ requires streaming encode/decode pipeline
-// which is not yet implemented. V1 uses simple stop-and-wait with per-chunk ack.
-pub const K_PROTOCOL_VERSION: i32 = 1;
+// V2 enables the streaming DATA pipeline; V3+ features remain unimplemented.
+pub const K_PROTOCOL_VERSION: i32 = K_PROTOCOL_VERSION2;
+
 pub const K_LAST_CHUNK_TIME_COUNT: usize = 10;
 
 // ─── Transfer Action (JSON over protocol) ──────────────────────────────────
@@ -114,6 +114,8 @@ fn default_newline() -> String {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TransferConfig {
+    #[serde(default = "default_lang")]
+    pub lang: String,
     #[serde(default)]
     pub quiet: bool,
     #[serde(default)]
@@ -146,6 +148,7 @@ impl Default for TransferConfig {
     fn default() -> Self {
         TransferConfig {
             quiet: false,
+            lang: default_lang(),
             binary: false,
             directory: false,
             overwrite: false,
@@ -189,6 +192,7 @@ pub struct TrzszTransfer {
     pub windows_protocol: bool,
     pub flush_in_time: bool,
     pub transfer_config: TransferConfig,
+    pub peer_lang: String,
     pub created_files: Vec<String>,
     pub tunnel_connected: bool,
     pub bg_chan: mpsc::SyncSender<()>,
@@ -221,6 +225,7 @@ impl TrzszTransfer {
                 ..Default::default()
             },
             created_files: Vec::new(),
+            peer_lang: String::new(),
             tunnel_connected: false,
             bg_chan: bg_tx,
         }
@@ -334,6 +339,41 @@ impl TrzszTransfer {
             });
         }
         Ok(buf)
+    }
+    pub(crate) fn recv_check_limited(
+        &mut self,
+        expect_type: &str,
+        may_has_junk: bool,
+        timeout: Option<Instant>,
+        max_line_size: usize,
+    ) -> Result<String, TrzszError> {
+        self.check_stop()?;
+        let may_has_junk = may_has_junk || self.transfer_config.tmux_output_junk;
+        let line = self.buffer.read_line_for_limited(
+            Some(expect_type),
+            may_has_junk,
+            timeout,
+            max_line_size,
+        )?;
+        let idx = line
+            .iter()
+            .position(|&byte| byte == b':')
+            .filter(|&idx| idx >= 1)
+            .ok_or_else(|| TrzszError {
+                message: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &line),
+                err_type: "colon".to_string(),
+                trace: true,
+            })?;
+        let typ = String::from_utf8_lossy(&line[1..idx]).into_owned();
+        let payload = String::from_utf8_lossy(&line[idx + 1..]).into_owned();
+        if typ != expect_type {
+            return Err(TrzszError {
+                message: payload,
+                err_type: typ,
+                trace: true,
+            });
+        }
+        Ok(payload)
     }
 
     pub fn send_integer(&mut self, typ: &str, val: i64) -> Result<(), TrzszError> {
@@ -527,6 +567,7 @@ impl TrzszTransfer {
             action.newline = "\n".to_string();
         }
         self.transfer_config.newline = action.newline.clone();
+        self.peer_lang = action.lang.clone();
         Ok(action)
     }
 
@@ -541,6 +582,7 @@ impl TrzszTransfer {
         action: &TransferAction,
         compress: CompressType,
     ) -> Result<(), TrzszError> {
+        self.peer_lang = action.lang.clone();
         let mut cfg_map = serde_json::json!({
             "lang": "rust",
         });
@@ -592,6 +634,7 @@ impl TrzszTransfer {
             err_type: String::new(),
             trace: false,
         })?;
+        self.peer_lang = config.lang.clone();
         self.transfer_config = config.clone();
         Ok(config)
     }
@@ -784,6 +827,10 @@ impl TrzszTransfer {
         file: &mut dyn FileReader,
         progress: &mut Option<&mut dyn ProgressCallback>,
     ) -> Result<Vec<u8>, TrzszError> {
+        if self.transfer_config.protocol >= K_PROTOCOL_VERSION2 {
+            return crate::v2::send_file_data(self, file, progress);
+        }
+
         let mut step: i64 = 0;
         let mut buf_size: usize = 1024;
         let mut buffer = vec![0u8; buf_size];
@@ -938,6 +985,9 @@ impl TrzszTransfer {
     ) -> Result<Vec<u8>, TrzszError> {
         if size < 0 {
             return Err(crate::comm::simple_error("Invalid file size"));
+        }
+        if self.transfer_config.protocol >= K_PROTOCOL_VERSION2 {
+            return crate::v2::recv_file_data(self, file, size, progress);
         }
         let mut step: i64 = 0;
         let mut hasher = Md5::new();

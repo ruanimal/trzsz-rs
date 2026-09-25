@@ -630,6 +630,12 @@ pub trait FileReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
     fn size(&self) -> i64;
     fn close(&mut self) -> io::Result<()>;
+    fn seek(&mut self, _pos: io::SeekFrom) -> io::Result<u64> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file reader is not seekable",
+        ))
+    }
 }
 
 pub struct SimpleFileReader {
@@ -648,6 +654,10 @@ impl FileReader for SimpleFileReader {
     fn close(&mut self) -> io::Result<()> {
         // The transfer-owned reader drops immediately after close returns.
         Ok(())
+    }
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        use std::io::Seek;
+        self.file.seek(pos)
     }
 }
 

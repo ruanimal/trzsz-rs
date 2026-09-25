@@ -27,7 +27,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
-use crate::comm::{TrzszError, err_interrupted, err_receive_data_timeout, err_stopped};
+use crate::comm::{
+    TrzszError, err_interrupted, err_receive_data_timeout, err_stopped, simple_error,
+};
 
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -155,6 +157,16 @@ impl TrzszBuffer {
         may_has_junk: bool,
         timeout: Option<Instant>,
     ) -> Result<Vec<u8>, TrzszError> {
+        self.read_line_for_limited(expect_type, may_has_junk, timeout, usize::MAX)
+    }
+
+    pub(crate) fn read_line_for_limited(
+        &mut self,
+        expect_type: Option<&str>,
+        may_has_junk: bool,
+        timeout: Option<Instant>,
+        max_line_size: usize,
+    ) -> Result<Vec<u8>, TrzszError> {
         self.read_buf.clear();
         self.timeout = timeout;
         self.new_timeout = None;
@@ -164,6 +176,9 @@ impl TrzszBuffer {
 
             if let Some(idx) = newline_idx {
                 // `buf` starts at the current read offset, so advance past this line.
+                if self.read_buf.len().saturating_add(idx) > max_line_size {
+                    return Err(simple_error("Protocol line exceeds maximum size"));
+                }
                 self.next_idx += idx + 1;
                 let line = &buf[..idx];
                 if may_has_junk && !self.read_buf.is_empty() && self.read_buf.last() == Some(&b'\r')
@@ -194,6 +209,9 @@ impl TrzszBuffer {
             }
 
             // The whole buffer had no newline; consume it before receiving the next chunk.
+            if self.read_buf.len().saturating_add(buf.len()) > max_line_size {
+                return Err(simple_error("Protocol line exceeds maximum size"));
+            }
             self.next_idx += buf.len();
             if buf.contains(&0x03) {
                 return Err(err_interrupted());

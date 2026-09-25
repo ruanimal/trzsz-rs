@@ -30,7 +30,7 @@ impl Write for ChanWriter {
     }
 }
 
-fn run_transfer_with_data(test_data: Vec<u8>) {
+fn run_transfer_with_mode(test_data: Vec<u8>, binary: bool, compress: CompressType) {
     // Set up source and destination paths.
     let dir = tempfile::tempdir().unwrap();
     let src_path = dir.path().join("source.txt");
@@ -69,16 +69,31 @@ fn run_transfer_with_data(test_data: Vec<u8>) {
             .recv_action()
             .map_err(|e| format!("B recv_action: {}", e.message))?;
 
+        let escape_value = if binary {
+            serde_json::Value::Array(
+                trzsz_rs::escape::get_escape_chars(true)
+                    .iter()
+                    .map(|(from, to)| {
+                        serde_json::json!([
+                            trzsz_rs::escape::bytes_to_latin1(from),
+                            trzsz_rs::escape::bytes_to_latin1(to)
+                        ])
+                    })
+                    .collect(),
+            )
+        } else {
+            serde_json::Value::Null
+        };
         transfer_b
             .send_config(
-                true,  // quiet
-                true,  // binary
+                true, // quiet
+                binary,
                 false, // directory
                 true,  // overwrite
-                &serde_json::Value::Null,
+                &escape_value,
                 0,
                 &action,
-                CompressType::No,
+                compress,
             )
             .map_err(|e| format!("B send_config: {}", e.message))?;
 
@@ -134,6 +149,45 @@ fn run_transfer_with_data(test_data: Vec<u8>) {
     assert_eq!(received, test_data, "content mismatch");
 }
 
+fn run_transfer_with_data(test_data: Vec<u8>) {
+    run_transfer_with_mode(test_data, true, CompressType::No);
+}
+
+#[test]
+fn test_v2_zstd_yes_and_no() {
+    run_transfer_with_mode(vec![b'a'; 256 * 1024], false, CompressType::Yes);
+    let mut data = Vec::with_capacity(256 * 1024);
+    let mut state = 0x1234_5678_u32;
+    for _ in 0..256 * 1024 {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        data.push((state >> 24) as u8);
+    }
+    run_transfer_with_mode(data, false, CompressType::No);
+}
+
+#[test]
+fn test_v2_auto_compression_boundaries_and_sampling() {
+    run_transfer_with_mode(Vec::new(), false, CompressType::Auto);
+    run_transfer_with_mode(vec![b'x'; 127], false, CompressType::Auto);
+    run_transfer_with_mode(vec![b'x'; 1024], false, CompressType::Auto);
+
+    let mut data = Vec::with_capacity(384 * 1024);
+    let mut state = 0x89ab_cdef_u32;
+    for _ in 0..384 * 1024 {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        data.push((state >> 24) as u8);
+    }
+    run_transfer_with_mode(data, false, CompressType::Auto);
+}
+
+#[test]
+fn test_v2_binary_zstd_and_escape() {
+    let data = (0..128 * 1024)
+        .map(|index| [0x1b, 0x03, 0x0d, 0x8d, 0xee, b'~'][index % 6])
+        .collect();
+    run_transfer_with_mode(data, true, CompressType::Yes);
+}
+
 #[test]
 fn test_transfer_small_file() {
     run_transfer_with_data(b"Hello, trzsz!\n".to_vec());
@@ -141,7 +195,6 @@ fn test_transfer_small_file() {
 
 #[test]
 fn test_transfer_medium_file() {
-    // ~4 KB, exercises a few send_data/recv_data round-trips.
     let mut data = Vec::with_capacity(4096);
     for i in 0..4096 {
         data.push((i % 256) as u8);
@@ -151,8 +204,6 @@ fn test_transfer_medium_file() {
 
 #[test]
 fn test_transfer_large_file() {
-    // 256 KB, well past any single chunk buffer size, exercises the dynamic
-    // buffer growth in send_file_data and the read_binary path.
     let mut data = Vec::with_capacity(256 * 1024);
     for i in 0..(256 * 1024) {
         data.push(((i * 31) % 256) as u8);
