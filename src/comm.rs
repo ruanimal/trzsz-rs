@@ -377,6 +377,15 @@ pub enum TmuxMode {
     Control,
 }
 
+pub(crate) fn binary_mode_enabled(
+    requested: bool,
+    remote_supports_binary: bool,
+    tmux_compatible: bool,
+    on_windows: bool,
+) -> bool {
+    requested && remote_supports_binary && tmux_compatible && !on_windows
+}
+
 pub fn check_tmux() -> Result<(TmuxMode, Option<String>, i32), TrzszError> {
     if std::env::var("TMUX").is_err() {
         return Ok((TmuxMode::None, None, -1));
@@ -742,6 +751,15 @@ mod tests {
             BufferSize::parse("2GB").unwrap_err().message,
             "Greater than 1G"
         );
+    }
+
+    #[test]
+    fn test_binary_mode_platform_fallbacks() {
+        assert!(binary_mode_enabled(true, true, true, false));
+        assert!(!binary_mode_enabled(true, true, false, false));
+        assert!(!binary_mode_enabled(true, true, true, true));
+        assert!(!binary_mode_enabled(false, true, true, false));
+        assert!(!binary_mode_enabled(true, false, true, false));
     }
 
     #[test]

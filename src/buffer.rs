@@ -119,6 +119,15 @@ impl TrzszBuffer {
         may_has_junk: bool,
         timeout: Option<Instant>,
     ) -> Result<Vec<u8>, TrzszError> {
+        self.read_line_for(None, may_has_junk, timeout)
+    }
+
+    pub fn read_line_for(
+        &mut self,
+        expect_type: Option<&str>,
+        may_has_junk: bool,
+        timeout: Option<Instant>,
+    ) -> Result<Vec<u8>, TrzszError> {
         self.read_buf.clear();
         self.timeout = timeout;
         self.new_timeout = None;
@@ -127,9 +136,7 @@ impl TrzszBuffer {
             let newline_idx = buf.iter().position(|&b| b == b'\n');
 
             if let Some(idx) = newline_idx {
-                // Advance next_idx past the newline so subsequent reads start
-                // after this line. Use += to match Go's behavior, since the
-                // returned `buf` is a slice starting at the original next_idx.
+                // `buf` starts at the current read offset, so advance past this line.
                 self.next_idx += idx + 1;
                 let line = &buf[..idx];
                 if may_has_junk && !self.read_buf.is_empty() && self.read_buf.last() == Some(&b'\r')
@@ -142,11 +149,24 @@ impl TrzszBuffer {
                 if self.read_buf.contains(&0x03) {
                     return Err(err_interrupted());
                 }
-                return Ok(self.read_buf.clone());
+                let mut line = self.read_buf.clone();
+                if may_has_junk {
+                    if let Some(expect_type) = expect_type {
+                        let expected = format!("#{}:", expect_type);
+                        if let Some(idx) = find_last_subslice(&line, expected.as_bytes()) {
+                            line.drain(..idx);
+                        } else if let Some(idx) = line.iter().rposition(|&b| b == b'#') {
+                            if idx > 0 {
+                                line.drain(..idx);
+                            }
+                        }
+                    }
+                    line = strip_tmux_status_line(line);
+                }
+                return Ok(line);
             }
 
-            // Whole buffer consumed without newline; advance next_idx so the
-            // next read pulls from the channel.
+            // The whole buffer had no newline; consume it before receiving the next chunk.
             self.next_idx += buf.len();
             if buf.contains(&0x03) {
                 return Err(err_interrupted());
@@ -154,7 +174,6 @@ impl TrzszBuffer {
             self.read_buf.extend_from_slice(&buf);
         }
     }
-
     pub fn read_binary(
         &mut self,
         size: usize,
@@ -264,6 +283,36 @@ impl TrzszBuffer {
                 return Ok(self.read_buf.clone());
             }
         }
+    }
+}
+
+fn find_last_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
+}
+
+fn strip_tmux_status_line(mut line: Vec<u8>) -> Vec<u8> {
+    loop {
+        let Some(begin) = line.windows(3).position(|window| window == b"\x1bP=") else {
+            return line;
+        };
+        let Some(mid_rel) = line[begin + 3..]
+            .windows(3)
+            .position(|window| window == b"\x1bP=")
+        else {
+            line.truncate(begin);
+            return line;
+        };
+        let mid = begin + 3 + mid_rel + 3;
+        let Some(end_rel) = line[mid..]
+            .windows(2)
+            .position(|window| window == b"\x1b\\")
+        else {
+            line.truncate(begin);
+            return line;
+        };
+        line.drain(begin..mid + end_rel + 2);
     }
 }
 

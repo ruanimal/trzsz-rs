@@ -300,13 +300,14 @@ impl TrzszTransfer {
 
     pub fn recv_line(
         &mut self,
-        _expect_type: &str,
+        expect_type: &str,
         may_has_junk: bool,
         timeout: Option<Instant>,
     ) -> Result<Vec<u8>, TrzszError> {
         self.check_stop()?;
-        let line = self.buffer.read_line(may_has_junk, timeout)?;
-        Ok(line)
+        let may_has_junk = may_has_junk || self.transfer_config.tmux_output_junk;
+        self.buffer
+            .read_line_for(Some(expect_type), may_has_junk, timeout)
     }
 
     pub fn recv_check(
@@ -316,22 +317,25 @@ impl TrzszTransfer {
         timeout: Option<Instant>,
     ) -> Result<String, TrzszError> {
         let line = self.recv_line(expect_type, may_has_junk, timeout)?;
-        let line_str = String::from_utf8_lossy(&line);
-        let idx = line_str.find(':').ok_or_else(|| TrzszError {
-            message: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &line),
-            err_type: "colon".to_string(),
-            trace: true,
-        })?;
-        let typ = &line_str[1..idx];
-        let buf = &line_str[idx + 1..];
+        let idx = line
+            .iter()
+            .position(|&b| b == b':')
+            .filter(|&idx| idx >= 1)
+            .ok_or_else(|| TrzszError {
+                message: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &line),
+                err_type: "colon".to_string(),
+                trace: true,
+            })?;
+        let typ = String::from_utf8_lossy(&line[1..idx]).into_owned();
+        let buf = String::from_utf8_lossy(&line[idx + 1..]).into_owned();
         if typ != expect_type {
             return Err(TrzszError {
-                message: buf.to_string(),
-                err_type: typ.to_string(),
+                message: buf,
+                err_type: typ,
                 trace: true,
             });
         }
-        Ok(buf.to_string())
+        Ok(buf)
     }
 
     pub fn send_integer(&mut self, typ: &str, val: i64) -> Result<(), TrzszError> {
@@ -428,7 +432,8 @@ impl TrzszTransfer {
         if !self.transfer_config.binary {
             return self.send_binary("DATA", data);
         }
-        let escaped = escape::escape_data(data, &self.get_escape_table());
+        let table = self.get_escape_table()?;
+        let escaped = escape::escape_data(data, &table);
         let header = format!("#DATA:{}\n", escaped.len());
         self.write_all(header.as_bytes())?;
         self.write_all(&escaped)
@@ -440,11 +445,14 @@ impl TrzszTransfer {
             return self.recv_binary("DATA", false, timeout);
         }
         let size = self.recv_integer("DATA", false, timeout)?;
+        if size < 0 {
+            return Err(crate::comm::simple_error("Invalid DATA size"));
+        }
         if size == 0 {
             return Ok(vec![]);
         }
         let data = self.buffer.read_binary(size as usize, timeout)?;
-        let table = self.get_escape_table();
+        let table = self.get_escape_table()?;
         let (unescaped, remaining) = escape::unescape_data(&data, &table, None)?;
         if !remaining.is_empty() {
             return Err(crate::comm::simple_error("Unescape has bytes remaining"));
@@ -452,15 +460,14 @@ impl TrzszTransfer {
         Ok(unescaped)
     }
 
-    fn get_escape_table(&self) -> EscapeTable {
-        if let Some(ref chars) = self.transfer_config.escape_chars {
-            if let Ok(arr) = chars.as_array().cloned().ok_or(()) {
-                escape::escape_chars_to_table(&arr).unwrap_or_default()
-            } else {
-                EscapeTable::default()
-            }
+    fn get_escape_table(&self) -> Result<EscapeTable, TrzszError> {
+        if let Some(chars) = &self.transfer_config.escape_chars {
+            let arr = chars
+                .as_array()
+                .ok_or_else(|| crate::comm::simple_error("Escape chars invalid"))?;
+            escape::escape_chars_to_table(arr)
         } else {
-            EscapeTable::default()
+            Ok(EscapeTable::default())
         }
     }
 
@@ -565,6 +572,9 @@ impl TrzszTransfer {
         }
         if compress != CompressType::Auto {
             cfg_map["compress"] = serde_json::json!(compress as i32);
+        }
+        if self.transfer_config.tmux_output_junk {
+            cfg_map["tmux_output_junk"] = serde_json::json!(true);
         }
 
         // Deserialize into TransferConfig
@@ -769,6 +779,9 @@ impl TrzszTransfer {
         let mut buffer = vec![0u8; buf_size];
         let mut hasher = Md5::new();
         let size = file.size();
+        if size < 0 {
+            return Err(crate::comm::simple_error("Invalid file size"));
+        }
 
         while step < size {
             let begin_time = Instant::now();
@@ -785,6 +798,12 @@ impl TrzszTransfer {
                     err_type: String::new(),
                     trace: false,
                 })?;
+            if n == 0 {
+                return Err(crate::comm::simple_trzsz_error(
+                    "Unexpected EOF",
+                    format!("sent {} of {} bytes", step, size),
+                ));
+            }
             let length = n as i64;
             let data = &buffer[..n];
             self.send_data(data)?;
@@ -875,6 +894,9 @@ impl TrzszTransfer {
 
     pub fn recv_file_size(&mut self) -> Result<i64, TrzszError> {
         let size = self.recv_integer("SIZE", false, self.get_new_timeout())?;
+        if size < 0 {
+            return Err(crate::comm::simple_error("Invalid file size"));
+        }
         self.send_integer("SUCC", size)?;
         Ok(size)
     }
@@ -884,17 +906,31 @@ impl TrzszTransfer {
         file: &mut dyn FileWriter,
         size: i64,
     ) -> Result<Vec<u8>, TrzszError> {
+        if size < 0 {
+            return Err(crate::comm::simple_error("Invalid file size"));
+        }
         let mut step: i64 = 0;
         let mut hasher = Md5::new();
         while step < size {
             let begin_time = Instant::now();
             let data = self.recv_data()?;
+            let length = data.len() as i64;
+            if length == 0 {
+                return Err(crate::comm::simple_trzsz_error(
+                    "Unexpected empty DATA chunk",
+                    format!("at {} of {} bytes", step, size),
+                ));
+            }
+            if length > size - step {
+                return Err(crate::comm::simple_error(
+                    "DATA exceeds negotiated file size",
+                ));
+            }
             file.write_all(&data).map_err(|e| TrzszError {
                 message: e.to_string(),
                 err_type: String::new(),
                 trace: false,
             })?;
-            let length = data.len() as i64;
             step += length;
             self.send_integer("SUCC", length)?;
             hasher.update(&data);
@@ -970,6 +1006,11 @@ impl TrzszTransfer {
         path: &Path,
         src_file: &SourceFile,
     ) -> Result<(Option<Box<dyn FileWriter>>, String), TrzszError> {
+        if src_file.rel_path.is_empty() {
+            return Err(crate::comm::simple_error(
+                "Invalid source file: empty path_name",
+            ));
+        }
         let local_name = if self.transfer_config.overwrite {
             src_file.rel_path[0].clone()
         } else {

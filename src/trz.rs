@@ -124,7 +124,11 @@ pub fn trz_main(args: &TrzArgs) -> i32 {
         % 10_000_000_000)
         * 100;
 
-    let mode = if args.base.directory { "D" } else { "R" };
+    let mode = if args.base.effective_directory() {
+        "D"
+    } else {
+        "R"
+    };
     let header = format!(
         "\x1b[s::TRZSZ:TRANSFER:{}:{}:{:013}:0\r\n",
         mode, TRZSZ_VERSION, unique_id
@@ -191,8 +195,8 @@ pub fn trz_main(args: &TrzArgs) -> i32 {
 fn recv_files(
     transfer: &mut TrzszTransfer,
     args: &TrzArgs,
-    _tmux_mode: comm::TmuxMode,
-    _tmux_pane_width: i32,
+    tmux_mode: comm::TmuxMode,
+    tmux_pane_width: i32,
 ) -> Result<String, TrzszError> {
     let action = transfer.recv_action()?;
     if !action.confirm {
@@ -200,10 +204,12 @@ fn recv_files(
         return Ok("Cancelled".to_string());
     }
 
-    let mut binary = args.base.binary;
-    if binary && !action.support_binary {
-        binary = false;
-    }
+    let binary = comm::binary_mode_enabled(
+        args.base.binary,
+        action.support_binary,
+        tmux_mode == comm::TmuxMode::None,
+        comm::is_running_on_windows(),
+    );
 
     if args.base.fork && !action.fork {
         return Err(comm::simple_error(
@@ -211,7 +217,8 @@ fn recv_files(
         ));
     }
 
-    if args.base.directory && !action.support_directory {
+    let directory = args.base.effective_directory();
+    if directory && !action.support_directory {
         return Err(comm::simple_error(
             "The client doesn't support transfer directory",
         ));
@@ -227,8 +234,8 @@ fn recv_files(
             .iter()
             .map(|(a, b)| {
                 vec![
-                    serde_json::Value::String(String::from_utf8_lossy(a).to_string()),
-                    serde_json::Value::String(String::from_utf8_lossy(b).to_string()),
+                    serde_json::Value::String(crate::escape::bytes_to_latin1(a)),
+                    serde_json::Value::String(crate::escape::bytes_to_latin1(b)),
                 ]
             })
             .collect::<Vec<_>>(),
@@ -236,13 +243,14 @@ fn recv_files(
     .unwrap_or(serde_json::Value::Null);
 
     transfer.transfer_config.binary = binary;
+    transfer.transfer_config.tmux_output_junk = tmux_mode == comm::TmuxMode::Normal;
     transfer.send_config(
         args.base.quiet,
         binary,
-        args.base.directory,
+        directory,
         args.base.overwrite,
         &escape_value,
-        _tmux_pane_width,
+        tmux_pane_width,
         &action,
         args.base
             .parse_compress()

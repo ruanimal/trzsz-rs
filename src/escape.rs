@@ -95,6 +95,26 @@ pub fn get_escape_chars(escape_all: bool) -> Vec<(Vec<u8>, Vec<u8>)> {
     escape_chars
 }
 
+/// Convert a byte sequence to a string whose Unicode scalar values represent Latin-1 bytes.
+pub fn bytes_to_latin1(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| char::from(b)).collect()
+}
+
+/// Convert a Latin-1 string back to its original bytes.
+pub fn latin1_to_bytes(value: &str) -> Result<Vec<u8>, TrzszError> {
+    value
+        .chars()
+        .map(|ch| {
+            u8::try_from(ch as u32).map_err(|_| {
+                simple_trzsz_error(
+                    "Escape chars invalid",
+                    format!("{} is not a Latin-1 byte", ch),
+                )
+            })
+        })
+        .collect()
+}
+
 /// Build an escape table from JSON-parsed escape chars array.
 pub fn escape_chars_to_table(
     escape_chars: &[serde_json::Value],
@@ -119,22 +139,15 @@ pub fn escape_chars_to_table(
             .as_str()
             .ok_or_else(|| simple_trzsz_error("Escape chars invalid", format!("{:?}", v)))?;
 
-        let from_bytes = from_str.as_bytes();
-        let to_bytes = to_str.as_bytes();
+        let from_bytes = latin1_to_bytes(from_str)?;
+        let to_bytes = latin1_to_bytes(to_str)?;
 
-        if from_bytes.len() != 1 {
+        if from_bytes.len() != 1 || to_bytes.len() != 2 || to_bytes[0] != ESCAPE_LEADER_BYTE {
             return Err(simple_trzsz_error(
                 "Escape chars invalid",
                 format!("{:?}", v),
             ));
         }
-        if to_bytes.len() != 2 || to_bytes[0] != ESCAPE_LEADER_BYTE {
-            return Err(simple_trzsz_error(
-                "Escape chars invalid",
-                format!("{:?}", v),
-            ));
-        }
-
         table.escape_codes[from_bytes[0] as usize] = Some(to_bytes[1]);
         table.unescape_codes[to_bytes[1] as usize] = Some(from_bytes[0]);
     }
