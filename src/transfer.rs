@@ -180,7 +180,7 @@ pub struct TrzszTransfer {
     pub buffer: TrzszBuffer,
     pub writer: Box<dyn Write + Send>,
     pub stopped: AtomicBool,
-    pub stop_and_delete: AtomicBool,
+    pub stop_and_delete: Arc<AtomicBool>,
     pub term_reseted: AtomicBool,
     pub(crate) pausing: Arc<AtomicBool>,
     pub(crate) pause_idx: Arc<AtomicU32>,
@@ -213,7 +213,7 @@ impl TrzszTransfer {
             buffer: TrzszBuffer::new(),
             writer,
             stopped: AtomicBool::new(false),
-            stop_and_delete: AtomicBool::new(false),
+            stop_and_delete: Arc::new(AtomicBool::new(false)),
             term_reseted: AtomicBool::new(false),
             pausing: Arc::new(AtomicBool::new(false)),
             pause_idx: Arc::new(AtomicU32::new(0)),
@@ -335,6 +335,10 @@ impl TrzszTransfer {
             self.pause_supported.clone(),
         )
     }
+    pub(crate) fn stop_and_delete_handle(&self) -> Arc<AtomicBool> {
+        self.stop_and_delete.clone()
+    }
+
     pub(crate) fn stop_handle(&self) -> std::sync::Arc<AtomicBool> {
         self.buffer.stop_handle()
     }

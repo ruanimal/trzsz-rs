@@ -22,8 +22,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 use crate::args::TrzArgs;
@@ -161,49 +160,15 @@ pub fn trz_main(args: &TrzArgs) -> i32 {
         .unwrap_or(10 * 1024 * 1024);
     transfer.transfer_config.timeout = args.base.timeout;
 
-    // Wrap stdin reader
     let sender = transfer.buffer.sender();
-
-    // Start reading from stdin in a background thread
+    let interrupt_controller = crate::stop_prompt::StopPromptController::new(&transfer);
+    let input_controller = interrupt_controller.clone();
     std::thread::spawn(move || {
         let stdin = io::stdin();
-        let mut stdin_locked = stdin.lock();
-        let mut buf = [0u8; 32 * 1024];
-        loop {
-            match stdin_locked.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let _ = sender.send(buf[..n].to_vec());
-                }
-                Err(_) => break,
-            }
-        }
+        crate::stop_prompt::run_stdin_reader(stdin.lock(), sender, input_controller);
     });
-
-    // The first interrupt pauses V3+ transfers, the second resumes, and a
-    // subsequent interrupt stops the transfer.
-    let stop_handle = transfer.stop_handle();
-    let (pause_handle, pause_idx, pause_supported) = transfer.pause_handles();
-    let signal_count = Arc::new(AtomicU8::new(0));
-    let count = signal_count.clone();
-    ctrlc::set_handler(move || match count.fetch_add(1, Ordering::SeqCst) {
-        0 => {
-            if !pause_supported.load(Ordering::SeqCst) {
-                stop_handle.store(true, Ordering::SeqCst);
-            } else if !pause_handle.swap(true, Ordering::SeqCst) {
-                pause_idx.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-        1 => {
-            if pause_supported.load(Ordering::SeqCst) {
-                pause_handle.store(false, Ordering::SeqCst);
-            } else {
-                stop_handle.store(true, Ordering::SeqCst);
-            }
-        }
-        _ => stop_handle.store(true, Ordering::SeqCst),
-    })
-    .ok();
+    let signal_controller = interrupt_controller;
+    ctrlc::set_handler(move || signal_controller.handle_interrupt()).ok();
 
     let mut progress = if args.base.quiet || args.base.fork {
         None

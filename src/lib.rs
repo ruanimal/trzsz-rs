@@ -29,6 +29,7 @@ pub mod comm;
 pub mod escape;
 pub mod filter;
 pub mod progress;
+pub(crate) mod stop_prompt;
 pub mod transfer;
 pub mod trz;
 pub mod trzsz;
