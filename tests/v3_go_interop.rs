@@ -163,6 +163,26 @@ fn wait_for_file(
     }
 }
 
+fn wait_for_output(
+    output: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    marker: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if String::from_utf8_lossy(&output.lock().unwrap()).contains(marker) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "Timed out waiting for output marker {marker:?}. PTY output:\n{}",
+                String::from_utf8_lossy(&output.lock().unwrap())
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn stop_filter(mut child: PtyChild, mut writer: Box<dyn Write + Send>) {
     let _ = writer.write_all(b"exit\n");
     let _ = writer.flush();
@@ -183,7 +203,7 @@ fn create_home(root: &Path, key: &str, value: &Path) -> PathBuf {
 }
 
 #[test]
-fn go_filter_downloads_v3_zstd_stream_from_rust_tsz() {
+fn go_filter_downloads_zstd_stream_from_rust_tsz() {
     let temp = tempfile::tempdir().unwrap();
     let go_binary = build_go_filter(temp.path());
     let download = temp.path().join("downloads");
@@ -209,7 +229,7 @@ fn go_filter_downloads_v3_zstd_stream_from_rust_tsz() {
 }
 
 #[test]
-fn go_filter_receives_v3_compress_yes_without_comp_line() {
+fn go_filter_receives_compress_yes_without_comp_line() {
     let temp = tempfile::tempdir().unwrap();
     let go_binary = build_go_filter(temp.path());
     let download = temp.path().join("downloads");
@@ -238,7 +258,7 @@ fn go_filter_receives_v3_compress_yes_without_comp_line() {
     stop_filter(child, writer);
 }
 #[test]
-fn go_filter_resumes_rust_v3_transfer_after_hash_mismatch() {
+fn go_filter_resumes_rust_transfer_after_hash_mismatch() {
     let temp = tempfile::tempdir().unwrap();
     let go_binary = build_go_filter(temp.path());
     let download = temp.path().join("downloads");
@@ -266,7 +286,7 @@ fn go_filter_resumes_rust_v3_transfer_after_hash_mismatch() {
     stop_filter(child, writer);
 }
 #[test]
-fn go_filter_uploads_v3_zstd_stream_to_rust_trz() {
+fn go_filter_uploads_zstd_stream_to_rust_trz() {
     let temp = tempfile::tempdir().unwrap();
     let go_probe = build_go_upload_probe(temp.path());
     let expected = vec![b'g'; 384 * 1024];
@@ -292,4 +312,160 @@ fn go_filter_uploads_v3_zstd_stream_to_rust_trz() {
         );
         assert_eq!(std::fs::read(destination.join(&name)).unwrap(), expected);
     }
+}
+
+fn build_go_directory_upload_probe(temp: &Path) -> PathBuf {
+    let go_module = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("trzsz-go");
+    let source = temp.join("go_directory_upload_probe.go");
+    let output = temp.join("go-directory-upload-probe");
+    std::fs::write(
+        &source,
+        r#"package main
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+
+	"github.com/trzsz/trzsz-go/trzsz"
+)
+
+func fail(err error) {
+	fmt.Fprintln(os.Stderr, err)
+	os.Exit(1)
+}
+
+func main() {
+	if len(os.Args) != 5 {
+		fail(fmt.Errorf("usage: probe directory standalone trz-bin destination"))
+	}
+	server := exec.Command(os.Args[3], "-d", "-q", os.Args[4])
+	serverIn, err := server.StdinPipe()
+	if err != nil { fail(err) }
+	serverOut, err := server.StdoutPipe()
+	if err != nil { fail(err) }
+	server.Stderr = os.Stderr
+	if err := server.Start(); err != nil { fail(err) }
+	clientInput, clientInputWriter := io.Pipe()
+	filter := trzsz.NewTrzszFilter(clientInput, os.Stdout, serverIn, serverOut,
+		trzsz.TrzszOptions{TerminalColumns: 80})
+	result, err := filter.OneTimeUpload([]string{os.Args[1], os.Args[2]})
+	if err != nil {
+		filter.Close()
+		_ = server.Process.Kill()
+		_ = server.Wait()
+		fail(err)
+	}
+	if err := <-result; err != nil {
+		filter.Close()
+		_ = server.Process.Kill()
+		_ = server.Wait()
+		fail(err)
+	}
+	_ = clientInputWriter.Close()
+	filter.Close()
+	if err := server.Wait(); err != nil { fail(err) }
+}
+"#,
+    )
+    .expect("write Go directory upload probe");
+    let status = Command::new("go")
+        .args(["build", "-o"])
+        .arg(&output)
+        .arg(&source)
+        .current_dir(go_module)
+        .status()
+        .expect("Go toolchain is required for V4 directory interoperability tests");
+    assert!(
+        status.success(),
+        "failed to build Go directory upload probe"
+    );
+    output
+}
+
+fn create_archive_sample(root: &Path) -> (PathBuf, PathBuf, Vec<u8>) {
+    let directory = root.join("bundle");
+    std::fs::create_dir_all(directory.join("nested/子")).unwrap();
+    std::fs::create_dir(directory.join("empty-dir")).unwrap();
+    std::fs::write(directory.join("empty-file"), []).unwrap();
+    let expected = "V4 directory data 😀\n".as_bytes().to_vec();
+    std::fs::write(directory.join("nested/子/文件.txt"), &expected).unwrap();
+    let standalone = root.join("standalone.txt");
+    std::fs::write(&standalone, b"independent file").unwrap();
+    (directory, standalone, expected)
+}
+
+fn assert_received_archive(destination: &Path, expected: &[u8]) {
+    assert!(destination.join("bundle/empty-dir").is_dir());
+    assert_eq!(
+        std::fs::read(destination.join("bundle/empty-file")).unwrap(),
+        b""
+    );
+    assert_eq!(
+        std::fs::read(destination.join("bundle/nested/子/文件.txt")).unwrap(),
+        expected
+    );
+    assert_eq!(
+        std::fs::read(destination.join("standalone.txt")).unwrap(),
+        b"independent file"
+    );
+}
+
+#[test]
+fn go_v4_directory_archive_interoperates_both_directions() {
+    let temp = tempfile::tempdir().unwrap();
+    let go_binary = build_go_filter(temp.path());
+
+    let rust_source = temp.path().join("rust-source");
+    std::fs::create_dir(&rust_source).unwrap();
+    let (directory, standalone, expected) = create_archive_sample(&rust_source);
+    let download = temp.path().join("go-downloads");
+    std::fs::create_dir(&download).unwrap();
+    let home = create_home(temp.path(), "DefaultDownloadPath", &download);
+    let (child, mut writer, output) = start_go_filter(&go_binary, &home, temp.path());
+    thread::sleep(Duration::from_millis(300));
+    let command = format!(
+        "{} -d -q {} {}\n",
+        shell_quote(Path::new(env!("CARGO_BIN_EXE_tsz"))),
+        shell_quote(&directory),
+        shell_quote(&standalone)
+    );
+    writer.write_all(command.as_bytes()).unwrap();
+    writer.flush().unwrap();
+    wait_for_file(
+        &download.join("bundle/nested/子/文件.txt"),
+        &expected,
+        Duration::from_secs(30),
+        &output,
+    );
+    wait_for_file(
+        &download.join("standalone.txt"),
+        b"independent file",
+        Duration::from_secs(30),
+        &output,
+    );
+    wait_for_output(
+        &output,
+        "Saved 2 files/directories",
+        Duration::from_secs(30),
+    );
+    assert_received_archive(&download, &expected);
+    stop_filter(child, writer);
+
+    let go_source = temp.path().join("go-source");
+    std::fs::create_dir(&go_source).unwrap();
+    let (directory, standalone, expected) = create_archive_sample(&go_source);
+    let upload = temp.path().join("rust-downloads");
+    std::fs::create_dir(&upload).unwrap();
+    let probe = build_go_directory_upload_probe(temp.path());
+    let status = Command::new(probe)
+        .arg(directory)
+        .arg(standalone)
+        .arg(env!("CARGO_BIN_EXE_trz"))
+        .arg(&upload)
+        .status()
+        .expect("run Go directory upload probe");
+    assert!(status.success(), "Go directory upload probe failed");
+    assert_received_archive(&upload, &expected);
 }

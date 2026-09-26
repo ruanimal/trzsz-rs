@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 use md5::Md5;
 use sha2::Digest;
 
+use crate::archive::{ArchiveFileReader, ArchiveFileWriter};
 use crate::buffer::TrzszBuffer;
 use crate::comm::{
     CompressType, FileReader, FileWriter, SimpleFileReader, SimpleFileWriter, SourceFile,
@@ -49,8 +50,8 @@ use crate::version::{TRZSZ_VERSION, TrzszVersion};
 pub const K_PROTOCOL_VERSION2: i32 = 2;
 pub const K_PROTOCOL_VERSION3: i32 = 3;
 pub const K_PROTOCOL_VERSION4: i32 = 4;
-// V3 adds resumable prefix hashes and Go-compatible COMP negotiation.
-pub const K_PROTOCOL_VERSION: i32 = K_PROTOCOL_VERSION3;
+// V4 adds directory archive streams; V3 adds prefix HASH resume and COMP negotiation.
+pub const K_PROTOCOL_VERSION: i32 = K_PROTOCOL_VERSION4;
 
 pub const K_LAST_CHUNK_TIME_COUNT: usize = 10;
 
@@ -827,6 +828,13 @@ impl TrzszTransfer {
         if target.size < 0 {
             return Err(crate::comm::simple_error("Invalid target file size"));
         }
+        if !src_file.sub_files.is_empty() {
+            let reader = ArchiveFileReader::new(src_file.sub_files.clone(), src_file.path_id)
+                .map_err(|error| {
+                    crate::comm::simple_trzsz_error("Create archive reader failed", error)
+                })?;
+            return Ok((Some(Box::new(reader)), target.name));
+        }
         if src_file.is_dir {
             return Ok((None, target.name));
         }
@@ -937,12 +945,17 @@ impl TrzszTransfer {
         source_files: &[SourceFile],
         progress: &mut Option<&mut dyn ProgressCallback>,
     ) -> Result<Vec<String>, TrzszError> {
+        let source_files = prepare_source_files(
+            source_files,
+            self.transfer_config.protocol,
+            self.transfer_config.overwrite,
+        );
         self.send_file_num(source_files.len() as i64)?;
         if let Some(p) = progress.as_mut() {
             p.on_num(source_files.len() as i64);
         }
         let mut remote_names = Vec::new();
-        for src_file in source_files {
+        for src_file in &source_files {
             let (file_opt, remote_name) = if self.transfer_config.protocol >= K_PROTOCOL_VERSION3 {
                 self.send_file_name_v3(src_file, progress)?
             } else {
@@ -1191,6 +1204,11 @@ impl TrzszTransfer {
                 "Invalid source file: empty path_name",
             ));
         }
+        if src_file.archive {
+            crate::archive::validate_archive_root(&src_file.rel_path[0]).map_err(|error| {
+                crate::comm::simple_trzsz_error("Invalid archive root path", error)
+            })?;
+        }
         let local_name = if self.transfer_config.overwrite {
             src_file.rel_path[0].clone()
         } else if let Some(v) = self.file_name_map.get(&src_file.path_id) {
@@ -1201,6 +1219,18 @@ impl TrzszTransfer {
             name
         };
 
+        if src_file.archive {
+            if !src_file.is_dir {
+                return Err(crate::comm::simple_error("Archive is not a directory"));
+            }
+            let root = path.join(&local_name);
+            create_dir_all_with_mode(&root, src_file.perm.unwrap_or(0) | 0o700).map_err(
+                |error| crate::comm::simple_trzsz_error("Create archive directory failed", error),
+            )?;
+            self.add_created_files(root.to_str().unwrap_or(""));
+            let writer = ArchiveFileWriter::new(root, src_file.path_id);
+            return Ok((Some(Box::new(writer)), local_name));
+        }
         if src_file.is_dir {
             let full_path = if src_file.rel_path.len() > 1 {
                 let parts: Vec<&str> = src_file.rel_path[1..].iter().map(|s| s.as_str()).collect();
@@ -1252,6 +1282,31 @@ impl TrzszTransfer {
             ((idx + 1) % K_LAST_CHUNK_TIME_COUNT) as u32,
             Ordering::Relaxed,
         );
+    }
+}
+fn archive_source_files(source_files: &[SourceFile]) -> Vec<SourceFile> {
+    let mut archived = Vec::<SourceFile>::new();
+    let mut positions = HashMap::<i32, usize>::new();
+    for source in source_files {
+        if let Some(index) = positions.get(&source.path_id) {
+            archived[*index].sub_files.push(source.clone());
+        } else {
+            positions.insert(source.path_id, archived.len());
+            archived.push(source.clone());
+        }
+    }
+    archived
+}
+
+fn prepare_source_files(
+    source_files: &[SourceFile],
+    protocol: i32,
+    overwrite: bool,
+) -> Vec<SourceFile> {
+    if protocol >= K_PROTOCOL_VERSION4 && !overwrite {
+        archive_source_files(source_files)
+    } else {
+        source_files.to_vec()
     }
 }
 
@@ -1343,6 +1398,65 @@ mod tests {
         assert_eq!(config.timeout, 20);
         assert_eq!(config.newline, "\n");
         assert_eq!(config.bufsize, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn v4_archives_only_when_not_overwriting() {
+        fn source(path_id: i32, name: &str, is_dir: bool) -> SourceFile {
+            SourceFile {
+                path_id,
+                abs_path: std::path::PathBuf::new(),
+                rel_path: vec![name.to_string()],
+                is_dir,
+                archive: false,
+                sub_files: Vec::new(),
+                size: 0,
+                perm: None,
+            }
+        }
+
+        let files = vec![
+            source(0, "bundle", true),
+            source(0, "nested.txt", false),
+            source(1, "standalone.txt", false),
+        ];
+        let archived = prepare_source_files(&files, K_PROTOCOL_VERSION4, false);
+        assert_eq!(archived.len(), 2);
+        assert_eq!(archived[0].sub_files.len(), 1);
+        let wire: SourceFile = serde_json::from_str(&archived[0].marshal().unwrap()).unwrap();
+        assert!(wire.archive);
+        assert!(wire.sub_files.is_empty());
+
+        for (protocol, overwrite) in [(K_PROTOCOL_VERSION4, true), (K_PROTOCOL_VERSION3, false)] {
+            let files = prepare_source_files(&files, protocol, overwrite);
+            assert_eq!(files.len(), 3);
+            assert!(files.iter().all(|file| file.sub_files.is_empty()));
+        }
+        assert_eq!(K_PROTOCOL_VERSION, K_PROTOCOL_VERSION4);
+    }
+    #[test]
+    fn archive_root_path_cannot_escape_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("download");
+        std::fs::create_dir(&destination).unwrap();
+        let outside = temp.path().join("escaped");
+        let source = SourceFile {
+            path_id: 0,
+            abs_path: std::path::PathBuf::new(),
+            rel_path: vec!["../escaped".to_string()],
+            is_dir: true,
+            archive: true,
+            sub_files: Vec::new(),
+            size: 0,
+            perm: None,
+        };
+        let mut transfer = TrzszTransfer::new(Box::new(std::io::sink()));
+        let error = transfer
+            .create_dir_or_file(&destination, &source, false)
+            .err()
+            .unwrap();
+        assert!(error.message.contains("Invalid archive root path"));
+        assert!(!outside.exists());
     }
 
     struct TrackingWriter(std::sync::Arc<AtomicBool>);

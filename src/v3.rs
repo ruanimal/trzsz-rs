@@ -5,7 +5,7 @@ use sha2::Digest;
 
 use crate::comm::{FileReader, FileWriter, TrzszError};
 use crate::progress::ProgressCallback;
-use crate::transfer::TrzszTransfer;
+use crate::transfer::{K_PROTOCOL_VERSION4, TrzszTransfer};
 
 const PREFIX_HASH_STEP: i64 = 10 * 1024 * 1024;
 const PREFIX_HASH_BUFFER_SIZE: usize = 64 * 1024;
@@ -41,7 +41,9 @@ pub(crate) fn send_prefix_hash(
         callback.on_size(source_size);
     }
 
-    transfer.send_integer("SIZE", source_size)?;
+    if transfer.transfer_config.protocol < K_PROTOCOL_VERSION4 {
+        transfer.send_integer("SIZE", source_size)?;
+    }
 
     let prefix_size = source_size.min(target_size);
     file.seek(SeekFrom::Start(0))
@@ -131,7 +133,11 @@ pub(crate) fn recv_prefix_hash(
         callback.on_size(target_size);
     }
 
-    let source_size = transfer.recv_integer("SIZE", false, transfer.get_new_timeout())?;
+    let source_size = if transfer.transfer_config.protocol >= K_PROTOCOL_VERSION4 {
+        target_size
+    } else {
+        transfer.recv_integer("SIZE", false, transfer.get_new_timeout())?
+    };
     if source_size < 0 {
         return Err(crate::comm::simple_error("Invalid file size for HASH"));
     }
@@ -253,6 +259,7 @@ mod tests {
     use std::io::{self, Cursor, Write};
 
     use crate::escape;
+    use crate::transfer::K_PROTOCOL_VERSION3;
 
     struct MemoryFile {
         bytes: Cursor<Vec<u8>>,
@@ -366,6 +373,69 @@ mod tests {
         assert_eq!(file.bytes.position(), prefix.len() as u64);
     }
 
+    #[test]
+    fn v4_hash_uses_source_size_from_name_without_size_frame() {
+        let prefix = b"matching prefix";
+        let mut hasher = Md5::new();
+        hasher.update(prefix);
+        let digest = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let records = [
+            serde_json::json!({"step": prefix.len(), "hash": digest}).to_string(),
+            serde_json::json!({"over": true}).to_string(),
+        ];
+        let mut wire = Vec::new();
+        for record in &records {
+            wire.extend_from_slice(format!("#HASH:{}\n", escape::encode_string(record)).as_bytes());
+        }
+        let mut transfer = test_transfer(&wire);
+        transfer.transfer_config.protocol = K_PROTOCOL_VERSION4;
+        let mut file = MemoryFile::new(prefix.to_vec());
+        let remaining =
+            recv_prefix_hash(&mut transfer, &mut file, prefix.len() as i64 + 5, &mut None).unwrap();
+        assert_eq!(remaining, 5);
+    }
+
+    #[test]
+    fn hash_sender_includes_size_only_before_protocol_v4() {
+        struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        for (protocol, has_size_frame) in
+            [(K_PROTOCOL_VERSION3, true), (K_PROTOCOL_VERSION4, false)]
+        {
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut transfer = test_transfer(&[]);
+            transfer.transfer_config.protocol = protocol;
+            transfer.writer = Box::new(CaptureWriter(captured.clone()));
+            let ack = serde_json::json!({"step": 3, "match": true}).to_string();
+            transfer.add_received_data(
+                format!("#SUCC:{}\n", escape::encode_string(&ack)).as_bytes(),
+                false,
+            );
+            let mut file = MemoryReader {
+                bytes: Cursor::new(b"abc".to_vec()),
+            };
+            send_prefix_hash(&mut transfer, &mut file, 3, 3, &mut None).unwrap();
+            let wire = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+            assert_eq!(
+                wire.contains("#SIZE:3\n"),
+                has_size_frame,
+                "protocol {protocol}"
+            );
+        }
+    }
     #[test]
     fn malformed_hash_step_and_digest_are_rejected() {
         for record in [

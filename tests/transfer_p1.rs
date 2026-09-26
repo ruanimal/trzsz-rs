@@ -40,6 +40,7 @@ fn source_file(path: PathBuf, name: &str, size: usize) -> SourceFile {
         rel_path: vec![name.to_string()],
         is_dir: false,
         archive: false,
+        sub_files: Vec::new(),
         size: size as i64,
         perm: None,
     }
@@ -52,6 +53,7 @@ fn source_directory(path_id: i32, name: &str, perm: Option<u32>) -> SourceFile {
         rel_path: vec![name.to_string()],
         is_dir: true,
         archive: false,
+        sub_files: Vec::new(),
         size: 0,
         perm,
     }
@@ -63,6 +65,7 @@ fn source_nested_file(path_id: i32, directory: &str, name: &str, perm: Option<u3
         abs_path: PathBuf::new(),
         rel_path: vec![directory.to_string(), name.to_string()],
         is_dir: false,
+        sub_files: Vec::new(),
         archive: false,
         size: 0,
         perm,

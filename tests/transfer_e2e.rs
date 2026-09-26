@@ -31,7 +31,7 @@ impl Write for ChanWriter {
 }
 
 fn run_transfer_with_mode(test_data: Vec<u8>, binary: bool, compress: CompressType) {
-    run_transfer_with_preexisting(test_data, binary, compress, None);
+    run_transfer_with_preexisting(test_data, binary, compress, None, None);
 }
 
 fn run_transfer_with_preexisting(
@@ -39,6 +39,7 @@ fn run_transfer_with_preexisting(
     binary: bool,
     compress: CompressType,
     preexisting: Option<Vec<u8>>,
+    protocol: Option<i32>,
 ) {
     // Set up source and destination paths.
     let dir = tempfile::tempdir().unwrap();
@@ -57,6 +58,7 @@ fn run_transfer_with_preexisting(
         rel_path: vec!["source.txt".to_string()],
         is_dir: false,
         archive: false,
+        sub_files: Vec::new(),
         size: metadata.len() as i64,
         perm: None,
     };
@@ -77,10 +79,12 @@ fn run_transfer_with_preexisting(
 
     // B = server (tsz-like): recv_action -> send_config -> send_files -> recv_exit
     let b_handle = std::thread::spawn(move || -> Result<(), String> {
-        let action = transfer_b
+        let mut action = transfer_b
             .recv_action()
             .map_err(|e| format!("B recv_action: {}", e.message))?;
-
+        if let Some(protocol) = protocol {
+            action.protocol = protocol;
+        }
         let escape_value = if binary {
             serde_json::Value::Array(
                 trzsz_rs::escape::get_escape_chars(true)
@@ -226,14 +230,131 @@ fn test_transfer_large_file() {
 #[test]
 fn test_v3_prefix_hash_resume_and_mismatch_fallback() {
     let complete = vec![b'c'; 256 * 1024];
-    run_transfer_with_preexisting(complete.clone(), false, CompressType::No, Some(complete));
+    run_transfer_with_preexisting(
+        complete.clone(),
+        false,
+        CompressType::No,
+        Some(complete),
+        Some(3),
+    );
 
     let partial_data = vec![b'p'; 11 * 1024 * 1024 + 31];
     let matching_prefix = partial_data[..10 * 1024 * 1024].to_vec();
-    run_transfer_with_preexisting(partial_data, false, CompressType::No, Some(matching_prefix));
+    run_transfer_with_preexisting(
+        partial_data,
+        false,
+        CompressType::No,
+        Some(matching_prefix),
+        Some(3),
+    );
 
     let mismatch_data = vec![b'm'; 21 * 1024 * 1024 + 17];
     let mut existing = mismatch_data[..20 * 1024 * 1024].to_vec();
     existing[10 * 1024 * 1024 + 7] ^= 0xff;
-    run_transfer_with_preexisting(mismatch_data, false, CompressType::No, Some(existing));
+    run_transfer_with_preexisting(
+        mismatch_data,
+        false,
+        CompressType::No,
+        Some(existing),
+        Some(3),
+    );
+}
+
+fn run_directory_transfer(protocol: i32) {
+    let temp = tempfile::tempdir().unwrap();
+    let source_root = temp.path().join("bundle");
+    std::fs::create_dir_all(source_root.join("nested/子")).unwrap();
+    std::fs::create_dir(source_root.join("empty-dir")).unwrap();
+    std::fs::write(source_root.join("empty-file"), []).unwrap();
+    std::fs::write(
+        source_root.join("nested/子/文件.txt"),
+        "archive payload 😀\n",
+    )
+    .unwrap();
+    let standalone = temp.path().join("standalone.txt");
+    std::fs::write(&standalone, b"independent file").unwrap();
+    let sources =
+        trzsz_rs::comm::check_paths_readable(&[source_root.clone(), standalone.clone()], true)
+            .unwrap();
+    let destination = temp.path().join("received");
+    std::fs::create_dir(&destination).unwrap();
+
+    let mut transfer_a = TrzszTransfer::new(Box::new(std::io::sink()));
+    let mut transfer_b = TrzszTransfer::new(Box::new(std::io::sink()));
+    let a_sender = transfer_a.buffer.sender();
+    let b_sender = transfer_b.buffer.sender();
+    transfer_a.writer = Box::new(ChanWriter { sender: b_sender });
+    transfer_b.writer = Box::new(ChanWriter { sender: a_sender });
+    transfer_a.transfer_config.timeout = 5;
+    transfer_b.transfer_config.timeout = 5;
+
+    let destination_for_client = destination.clone();
+    let receiver = std::thread::spawn(move || -> Result<(), String> {
+        let action = transfer_b.recv_action().map_err(|error| error.message)?;
+        let mut action = action;
+        action.protocol = protocol;
+        transfer_b
+            .send_config(
+                true,
+                false,
+                true,
+                false,
+                &serde_json::Value::Null,
+                0,
+                &action,
+                CompressType::No,
+            )
+            .map_err(|error| error.message)?;
+        transfer_b
+            .send_files(&sources, &mut None)
+            .map_err(|error| error.message)?;
+        transfer_b.recv_exit().map_err(|error| error.message)?;
+        Ok(())
+    });
+    let sender = std::thread::spawn(move || -> Result<(), String> {
+        transfer_a
+            .send_action(true, None, false)
+            .map_err(|error| error.message)?;
+        let config = transfer_a.recv_config().map_err(|error| error.message)?;
+        if config.protocol != protocol {
+            return Err(format!(
+                "negotiated protocol {} != {protocol}",
+                config.protocol
+            ));
+        }
+        transfer_a
+            .recv_files(&destination_for_client, &mut None)
+            .map_err(|error| error.message)?;
+        transfer_a
+            .client_exit("done")
+            .map_err(|error| error.message)
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !sender.is_finished() || !receiver.is_finished() {
+        assert!(Instant::now() < deadline, "directory transfer timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    sender.join().unwrap().unwrap();
+    receiver.join().unwrap().unwrap();
+
+    assert!(destination.join("bundle/empty-dir").is_dir());
+    assert_eq!(
+        std::fs::read(destination.join("bundle/empty-file")).unwrap(),
+        b""
+    );
+    assert_eq!(
+        std::fs::read(destination.join("bundle/nested/子/文件.txt")).unwrap(),
+        "archive payload 😀\n".as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(destination.join("standalone.txt")).unwrap(),
+        b"independent file"
+    );
+}
+
+#[test]
+fn test_v4_directory_archive_and_v3_directory_fallback() {
+    run_directory_transfer(4);
+    run_directory_transfer(3);
 }

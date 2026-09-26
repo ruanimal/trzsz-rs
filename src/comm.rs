@@ -180,6 +180,8 @@ pub struct SourceFile {
     pub is_dir: bool,
     #[serde(default)]
     pub archive: bool,
+    #[serde(skip)]
+    pub sub_files: Vec<SourceFile>,
     #[serde(default)]
     pub size: i64,
     #[serde(default)]
@@ -301,6 +303,7 @@ fn check_path_readable_recursive(
             rel_path,
             is_dir: false,
             archive: false,
+            sub_files: Vec::new(),
             size: metadata.len() as i64,
             perm: Some(perm),
         });
@@ -320,6 +323,7 @@ fn check_path_readable_recursive(
         is_dir: true,
         archive: false,
         size: 0,
+        sub_files: Vec::new(),
         perm: Some(perm),
     });
 
@@ -707,7 +711,7 @@ pub trait SourceFileExt {
 
 impl SourceFile {
     pub fn sub_files(&self) -> &[SourceFile] {
-        &[]
+        &self.sub_files
     }
 }
 

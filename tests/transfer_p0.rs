@@ -247,6 +247,7 @@ fn directory_upload_creates_nested_paths_and_rejects_empty_path_name() {
         rel_path: vec!["bundle".to_string()],
         is_dir: true,
         archive: false,
+        sub_files: Vec::new(),
         size: 0,
         perm: None,
     };
@@ -270,6 +271,7 @@ fn directory_upload_creates_nested_paths_and_rejects_empty_path_name() {
         ],
         is_dir: false,
         archive: false,
+        sub_files: Vec::new(),
         size: 3,
         perm: None,
     };
