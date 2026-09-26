@@ -6,7 +6,7 @@
 
 - **Roadmap 第 1 步 / 传输 P0：已完成**（实现见提交 `06ab606`）：修复 Latin-1 转义、收发数据零进展、畸形协议行、`-r`、binary 降级及 `tmux_output_junk`。
 - **剩余传输 P1：已完成**：接收文件/目录按 Go 的 `perm | 0600` / `perm | 0700` 创建；停止删除兼容普通文件和目录；发送/接收句柄在成功、失败路径均 close；逐 DATA chunk 调用进度回调，`trz`/`tsz` 接入 stderr 进度条；Ctrl+C 通过共享 stop 状态唤醒 buffer 等待。
-- **V3+ 暂停/确认菜单已接入 `trz`/`tsz` CLI**：首次 Ctrl+C 暂停；暂停中再次 Ctrl+C 显示“停止并保留 / 停止并删除 / 继续”三项菜单；V1/V2 仍直接停止。stdin 复用协议流时，DATA 帧内的 ETX 保持为文件字节；完整 filter-side 按键分流仍需 Rust `TrzszFilter` input pump。
+- **V3+ 暂停/确认菜单与客户端 filter 核心已实现**：`trz`/`tsz` CLI 首次 Ctrl+C 暂停、再次弹出停止菜单；Rust `TrzszFilter` 提供显式 `run()`，实现双向 I/O pump、S/R/D 传输、host path picker、主动/一次性上传、状态/重绘/progress callback 及 close/error 收尾。filter 使用独立 client input 流分流按键；完整 Go 可选特性与 CLI/PTY 包装仍不在此范围。
 - V2 流水线、zstd 流编码/解码及 protocol 1 回退已实现；V2 每文件使用有界 DATA 窗口（最多 5 帧在途），文本流使用 Base64，binary 流使用 escape，文件结束后继续执行原 MD5 校验。V3+ 支持 Go 兼容 `#DATA:=` 暂停心跳；V1/V2 不启用暂停。Rust 最高声明 protocol 4。
 - **V3 HASH 断点续传已实现**：按 10 MiB 累积 MD5 checkpoint 协商，匹配前缀后从末端继续；摘要不匹配时保留最后一个匹配 checkpoint 并重传其后内容。Rust protocol 3 保留 HASH 前的整数 `SIZE` 行；Go V4 的 HASH 使用 NAME 中的源尺寸、不交换此整数行，Rust V4 已对齐。
 - **V4 目录归档已实现**：同一 `path_id` 的目录子项在非覆盖模式下聚合为单个归档 DATA 流；覆盖模式和 protocol 1–3 保持 Go 的非归档行为。
@@ -117,7 +117,7 @@ Go `handleServerSignal`：SIGINT/SIGTERM → `stopTransferringFiles(false)`（`c
 | **V1 回退** | protocol 小于 2 使用旧逐块 DATA/单整数 ACK | 收到 protocol 1 CFG 仍使用原 zlib+Base64 / binary 线格式及 stop-and-wait | 老对端不接收 V2 DATA 流，保持旧行为 |
 | **断点续传 HASH** | V3 使用 10 MiB 累积 MD5 checkpoint；V4 仍按同样 checkpoint 匹配，但从 NAME 的源 `size` 取尺寸，不交换整数 `SIZE` 行（`append.go:162-205,255-320`） | **已实现**：protocol 3 保留整数 `SIZE` 行；protocol 4 从 NAME 的 `size` 取源尺寸并省略该行；HASH/SUCC 校验、失配后截断到最后匹配点 | 老 V3 行为不变；Go V4 文件续传与 Go peer 兼容 |
 | **V4 目录归档** | V4 非覆盖模式将同 `path_id` 项打包为单个 NAME/DATA；归档流由每项的 base64(zlib(SourceFile JSON)) 行、后接其文件字节构成（`archive.go:81-94,106-185`）。覆盖模式不归档 | **已实现**：非覆盖 V4 按 `path_id` 聚合；归档 DATA reader/writer 维持 Go 线格式，跨任意 chunk 解码；归档不走 HASH，目标 SIZE 为 0；覆盖模式与 protocol 1–3 不聚合 | 目录树语义不变，减少目录中每个子项单独的 NAME/SIZE/MD5 协商 |
-| **暂停/确认停止** | V3 `#DATA:=` / `pausing`/`pauseIdx`（`pipeline.go:340-406`）；暂停时可停止保留/删除或继续 | **已实现（CLI）**：V3+ 发送 DATA 前等待恢复并每 100 ms 发 `#DATA:=`；暂停中 Ctrl+C 弹出数字菜单（1 保留、2 删除、3 继续）；V1/V2 仍直接停止 | CLI 支持暂停后选择停止/删除/继续；帧内 ETX 保持为数据；Rust `TrzszFilter` input pump 仍是桩，filter-side 按键分流尚未实现 |
+| **暂停/确认停止** | Go V3 `#DATA:=` / `pausing`/`pauseIdx`（`pipeline.go:340-406`）；暂停时可停止保留/删除或继续 | CLI 已支持 V3+ 暂停与确认菜单；`TrzszFilter` 核心输入泵独立分流 Ctrl+C/菜单键，空闲输入转发；V1/V2 直接停止 | CLI 复用协议 stdin 时 DATA 帧内 ETX 保持为文件字节；filter 接收端点是 host 提供的独立客户端输入，完整 library transfer worker/菜单运行于 `run()` |
 | **隧道 + fork 后台** | loopback listener 在触发头公布端口；`CLIENT/SERVER HELLO` 握手；ACT 标记 tunnel/support fork；CFG fork 后切后台 | **CLI 已实现**：`trz`/`tsz` 触发头公布动态 loopback 端口；验证 Go hello 后将 tunnel 输入并入缓冲区；ACT 协商后切换协议 writer；Unix `-f` fork/setsid，CFG 仅在 tunnel 已连且请求 fork 时置 `fork`/`quiet`。非 CLI/library 的 `TrzszTransfer::background()` channel 仍是桩，未用于此 CLI 路径 | 仓库 Go filter 显式配置 `SetTunnelConnector` 后双向真实传输通过；`-f` 当前仅 Unix 支持，Go 的交互式后台确认/终端菜单不在本次范围 |
 | **tmux 输出脏字节** | tmux 普通模式发送 `tmux_output_junk: true`，对端据此启用 `mayHasJunk` + `stripTmuxStatusLine` | **已修复（M0）**：普通 tmux 模式在 CFG 中发送该键，接收行按类型重同步并剥离 tmux 状态行 | 本地回归覆盖；真实 tmux 场景待验证 |
 
@@ -168,7 +168,7 @@ Go `handleServerSignal`：SIGINT/SIGTERM → `stopTransferringFiles(false)`（`c
 7. ✅ **P2 / V2 流水线完成** — 流式 zstd、五帧有界 ACK 窗口和 protocol 1 回退；V2 Go peer 仍固定 `!binary`，不收发 COMP。
 8. ✅ **P2 / V3 HASH + COMP 完成** — 实现 10 MiB HASH checkpoint 续传和 Go V3+ `yes/no/auto` COMP 规则；Rust protocol 3 的整数 `SIZE` 线格式及 Go V4 的 NAME-size 规则均有回归。
 9. ✅ **P2 / V4 目录归档完成** — V4 非覆盖模式按 `path_id` 聚合目录条目并以 Go 兼容归档 DATA 流还原；真实 Go 双向互通及 Rust V3 回退测试通过。
-10. ✅ **P2 完成** — 动态 tunnel 端口、Go hello 握手、协议 writer/input 切换、Unix fork/setsid、V3+ pause/resume 心跳及暂停后的 CLI 停止/删除确认菜单；Go filter tunnel 双向实测通过。非 Unix fork 与 Rust filter-side 菜单路径仍未实现。
+10. ✅ **P2 完成** — 动态 tunnel 端口、Go hello 握手、协议 writer/input 切换、Unix fork/setsid、V3+ pause/resume 心跳及暂停后的 CLI 停止/删除确认菜单；Go filter tunnel 双向实测通过。Rust `TrzszFilter` 核心双向传输与 lifecycle 已实现并由 `tests/filter_interop.rs` 覆盖；Relay、完整 Go 可选 filter 特性及非 Unix fork 仍未实现。
 
 ---
 

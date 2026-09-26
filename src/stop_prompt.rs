@@ -56,6 +56,26 @@ impl StopPromptController {
     }
 
     pub(crate) fn handle_interrupt(&self) {
+        self.handle_interrupt_with(show_stop_menu);
+    }
+
+    pub(crate) fn handle_filter_input(&self, key: u8, output: &mut dyn Write) {
+        if self.is_menu_active() {
+            self.handle_menu_key(key);
+        } else if key == 0x03 {
+            self.handle_interrupt_with(|| show_stop_menu_to(output));
+        }
+    }
+
+    pub(crate) fn handle_filter_eof(&self) {
+        if self.is_menu_active() {
+            self.finish(StopChoice::Continue);
+        } else if self.pausing.load(Ordering::SeqCst) {
+            self.finish(StopChoice::KeepFiles);
+        }
+    }
+
+    fn handle_interrupt_with(&self, show_menu: impl FnOnce()) {
         if !self.pause_supported.load(Ordering::SeqCst) {
             self.finish(StopChoice::KeepFiles);
             return;
@@ -73,12 +93,11 @@ impl StopPromptController {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            show_stop_menu();
+            show_menu();
         } else {
             self.finish(StopChoice::KeepFiles);
         }
     }
-
     fn is_menu_active(&self) -> bool {
         self.menu_active.load(Ordering::SeqCst)
     }
@@ -111,7 +130,7 @@ impl StopPromptController {
         }
     }
 
-    fn stop(&self, delete: bool) {
+    pub(crate) fn stop(&self, delete: bool) {
         self.stop_and_delete.store(delete, Ordering::SeqCst);
         self.stopped.store(true, Ordering::SeqCst);
     }
@@ -126,13 +145,17 @@ enum StopChoice {
 
 fn show_stop_menu() {
     let mut stderr = io::stderr().lock();
-    let _ = stderr.write_all(
+    show_stop_menu_to(&mut stderr);
+}
+
+fn show_stop_menu_to(output: &mut dyn Write) {
+    let _ = output.write_all(
         b"\r\nAre you sure you want to stop transferring files?\r\n\
 [1] Stop and keep transferred files\r\n\
 [2] Stop and delete transferred files\r\n\
 [3] Continue to transfer remaining files (q to continue)\r\n",
     );
-    let _ = stderr.flush();
+    let _ = output.flush();
 }
 
 pub(crate) fn run_stdin_reader<R: Read>(

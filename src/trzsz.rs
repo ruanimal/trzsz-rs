@@ -81,7 +81,7 @@ pub fn trzsz_main(args: &TrzszArgs) -> i32 {
             detect_trace_log: args.tracelog,
             ..Default::default()
         };
-        let mut filter = TrzszFilter::new(
+        let filter = TrzszFilter::new(
             Box::new(io::stdin()),
             Box::new(io::stdout()),
             pty_stdin,
@@ -107,7 +107,7 @@ pub fn trzsz_main(args: &TrzszArgs) -> i32 {
             enable_zmodem: args.zmodem,
             enable_osc52: args.osc52,
         };
-        let mut filter = TrzszFilter::new(
+        let filter = TrzszFilter::new(
             Box::new(io::stdin()),
             Box::new(io::stdout()),
             pty_stdin,

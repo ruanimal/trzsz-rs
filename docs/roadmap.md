@@ -5,7 +5,7 @@
 - `docs/transfer-gap-vs-go.md` —— 文件传输链路差距分析（服务端 `trz`/`tsz`，含实测结论）
 - `docs/library-porting-checklist.md` —— Go 库 API → Rust 移植清单（客户端 `TrzszFilter`/relay 等）
 
-**一句话结论：先做传输文档的 P0 正确性批次，紧接着做库文档的 Phase 0（API 形态决策），然后全力推 Phase 1（数据泵）。** 不是二选一，而是明确的先后依赖。
+**当前进度**：传输 P0/P1 与 V2–V4 协议已完成；库侧注入式 `TrzszFilter` 核心 Phase 0–3 已实现并通过本地 Go CLI 双向/目录互通。Relay 与 Phase 5 可选特性仍未实现，详见 [`docs/library-porting-checklist.md`](library-porting-checklist.md)。
 
 ---
 
@@ -43,41 +43,29 @@
 4. `effective_directory()` 接进 `trz.rs:120,197,215` / `tsz.rs:80,196,206`
 5. binary 降级提示后真正清 flag（`trz.rs:107-112`、`tsz.rs:104-109`）+ `send_config` 发 `tmux_output_junk`
 
-**验收**：把 Python 协议探针固化成回归测试 —— 现有 4 个 interop 测试因缺 Go 工具链**全部静默跳过**，且只覆盖下载方向 + base64；需补上传方向、目录、binary、重名、空文件用例。
+**当前验证**：`tests/filter_interop.rs` 构建仓库 Go `tsz`/`trz`，覆盖 Go→Rust filter 下载、Rust filter→Go 文件/目录上传及选择取消；外部 Go 工具缺失时该测试会明确失败。
 
 > ⚠️ 第 3 项与第 2 步的 `panic = "abort"` 去留要**一起决策**，别分两次改。
 
-### 第 2 步 · 库 Phase 0（约半天，决策 + 收敛）
+### 第 2 步 · 库 Phase 0（API 形态决策）✅
 
-对应 `docs/library-porting-checklist.md` Phase 0：
+已收敛为 `new()` 构造 → `run()` 阻塞运行 → `close()` 收尾；端点仍由宿主注入，filter 内部状态私有。保留 release `panic = "abort"`，对协议输入做校验；crate 发布元数据不属于本次目标。
 
-- 定生命周期：`new()` 构造 → `run()` 数据泵 → `close()` 收尾（Go 是在 `NewTrzszFilter` 里隐式 `go wrapInput()/wrapOutput()`，`filter.go:121-122`）
-- `pub` 边界收敛（现在内部类型全 `pub`，一发布就锁死重构）
-- **去掉 `panic = "abort"`**（库要 unwind；与第 1 步③合并决策）
-- crate 元数据（`repository`/`keywords`、crate-level `//!` 文档；不发 crates.io 就加 `publish = false`）
-- 产出：目标 API 草图（清单文档里已有）
+### 第 3 步 · 库 Phase 1 数据泵与传输闭环 ✅
 
-### 第 3 步 · 库 Phase 1.1-1.6 数据泵（最大价值块）
+`TrzszFilter` 已实现 client/server 双向 pump、跨 read trigger 检测、S/R/D worker、host path selectors、主动/一次性上传和关闭/错误收尾。`tests/filter_interop.rs` 构建仓库 Go `tsz`/`trz`，实测 Go→Rust 下载及 Rust→Go 文件/目录上传。
 
-对应 `docs/library-porting-checklist.md` Phase 1：
+### 第 4 步 · 库 Phase 2 进度与资源管理 ✅
 
-- 1.1 `wrap_input` / 1.2 `wrap_output` / 1.3 `handle_trzsz` / 1.4 `download_files` / 1.5 `upload_files` —— 先跑通 **base64 模式最小闭环**
-- 1.6 `detect_trzsz` 加固（`LastIndex`、**`TRZSZ→TRZSZGO` 重写**、重复 uniqueID 去重、`win_server` 判据修正、tmuxcc prefix）—— 缺重写会导致嵌套过滤器重复触发，应与 1.1-1.5 同批
+filter 按 CFG quiet 创建进度条，逐 chunk 更新宿主 progress callback，并在成功/取消/失败路径恢复光标；transfer 层文件 close、EOF 校验和权限等此前已完成。
 
-**验收**：rs filter ↔ 真实 Go `trz`/`tsz` **双向**互通；CI 加 Go 工具链 job 构建 `/tmp/go-trzsz`、`/tmp/go-trz`、`/tmp/go-tsz`，让 interop 真正跑起来。
+### 第 5 步 · 库 Phase 3 宿主联动 ✅（核心 API）
 
-> 这一步做完，`trzsz` 二进制才第一次"真的能用" —— 这是当前最大的功能空洞。
+已提供状态/重绘 callback、取消/删除、终端列更新、默认路径与可注入路径选择器。blocking reader 可注册 shutdown handler。宿主负责接入 resize signal；本次不提供原生 GUI picker 或 demo host。
 
-### 第 4 步 · 库 Phase 2 + 传输 P1
+### 后续步骤 · 明确排除
 
-- `on_step` 接进 `send/recv_file_data`、`create_progress_bar`、文件 `close()`（进度否则永远 0→100 跳变）
-- 传输 P1：`perm|0600`/`perm|0700` 权限保留、`delete_created_files` 兼容普通文件、`-r` 收尾
-
-### 第 5 步 · 库 Phase 3（宿主接入）
-
-回调 `set_transfer_state_callback` / `set_redraw_screen_func`、Ctrl+C → `stop_transferring_files`（需给 `TrzszBuffer` 加 stop channel）、SIGWINCH → `set_terminal_columns`、默认上传/下载路径 → 对话框（**必须给弹窗加开关**，嵌入方未必想弹）。
-
-**到这里才算能对标 trzsz-go 使用。**
+Relay（Phase 4）、drag/ZMODEM/OSC52/trace/tmux control mode（Phase 5）和自动 SSH/PTY/CLI 包装仍未实现；它们不属于本次 `TrzszFilter` 核心闭环。Rust transfer 的 V1–V4 协议早已支持，本次不改线缆格式。
 
 ### 第 6 步 · 可并行分支（按需排期）
 
@@ -87,23 +75,29 @@
 
 ---
 
-## 三、两个"不要先做"
+## 三、当前明确未纳入的扩展
 
-| 不要先做 | 原因 |
+| 范围 | 状态 |
 |---|---|
-| **协议 V2+/zstd（传输 P2 = 库 Phase 6）** | 工作量最大（`pipeline.go` 1076 行）但杠杆最低：基础互通还没稳，压缩与流水线的吞吐收益用户感知不到 |
-| **Phase 5（drag / zmodem / OSC52）** | 开关虽在但属外围功能，且 Phase 1 没做完它们连挂载点都没有 |
+| Relay / `trzsz -r` 跳板 | 未实现，本次 filter 只处理注入的四个 I/O 端点 |
+| drag、ZMODEM、OSC52、trace、tmux control mode、原生 GUI picker | 可选特性，未实现 |
+| 自动 SSH/PTY/CLI 生命周期与 resize signal 注册 | 由宿主负责；filter 提供 `run`/`close`、shutdown handler 和 terminal-columns API |
+| transfer protocol V2–V4 | 既有 Rust transfer 层已实现；本次不改线缆协议 |
 
 ---
 
 ## 四、里程碑与出口判据
 
-| 里程碑 | 覆盖步骤 | 出口判据 |
+| 里程碑 | 状态 | 证据 / 边界 |
 |---|---|---|
-| **M0 服务端正确** | 第 1 步 | 传输 P0 全部有回归测试；`trz -b` 与 Go 客户端可互通；脏输入不崩 |
-| **M1 库可用** | 第 2-3 步 | rs filter 与 Go `trz`/`tsz` 双向真实互通；`trzsz` 二进制能完成一次传输 |
-| **M2 体验对齐** | 第 4 步 | 进度条实时、`-r` 生效、权限保留、binary 可用 |
-| **M3 宿主接入** | 第 5 步 | demo 宿主完成"回调 / 取消 / resize"三件事 |
-| **M4+** | 第 6 步 | relay 走通跳板；`-c` 生效、断点续传 |
+| **M0 服务端正确** | ✅ | 传输 P0/P1 回归通过，Go V4 transfer interop 在 `tests/v3_go_interop.rs` |
+| **M1 核心 filter 可用** | ✅ | `tests/filter_interop.rs` 覆盖 S/R/D、本地 Go 互通、目录与取消 |
+| **M2 核心体验** | ✅ | progress callback/bar、错误/EOF/close 清理与 terminal columns API |
+| **M3 宿主核心 API** | ✅ | paths/selectors、上传入口、状态/重绘回调和 stop API；未新增 demo host |
+| **M4 Relay** | ⏭ | 不属于已批准的 TrzszFilter 核心目标 |
+| **M5 可选特性** | ⏭ | 按需排期 |
+| **M6 协议扩展** | ✅（既有） | V2–V4 已存在；本次不触碰协议能力 |
+
+**后续工作**：如需对齐 Go 的 Relay、可选 UI 功能或 wrapper 集成，应作为独立任务排期。
 
 **关键路径**：`第1步 → Phase 0 → Phase 1.1-1.6 → Phase 2.1 → Phase 3.3`。
