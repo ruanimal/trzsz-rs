@@ -26,6 +26,84 @@ fn build_go_filter(temp: &Path) -> PathBuf {
     assert!(status.success(), "failed to build repository Go filter");
     output
 }
+fn build_go_tunnel_probe(temp: &Path) -> PathBuf {
+    let go_module = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("trzsz-go");
+    let source = temp.join("go_tunnel_probe.go");
+    let output = temp.join("go-tunnel-probe");
+    std::fs::write(
+        &source,
+        r#"package main
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"time"
+
+	"github.com/trzsz/trzsz-go/trzsz"
+)
+
+type discardCloser struct{}
+func (discardCloser) Write(p []byte) (int, error) { return len(p), nil }
+func (discardCloser) Close() error { return nil }
+
+type notifyReader struct { io.Reader; done chan struct{} }
+func (r notifyReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if err == io.EOF { close(r.done) }
+	return n, err
+}
+
+func fail(err error) { fmt.Fprintln(os.Stderr, err); os.Exit(1) }
+
+func main() {
+	if len(os.Args) != 4 { fail(fmt.Errorf("usage: probe tsz source destination")) }
+	serverInChild, serverIn, err := os.Pipe(); if err != nil { fail(err) }
+	serverOut, serverOutChild, err := os.Pipe(); if err != nil { fail(err) }
+	clientIn, clientInputWriter := io.Pipe()
+	done := make(chan struct{})
+	filter := trzsz.NewTrzszFilter(clientIn, discardCloser{}, serverIn, notifyReader{serverOut, done},
+		trzsz.TrzszOptions{TerminalColumns: 80})
+	filter.SetDefaultDownloadPath(os.Args[3])
+	filter.SetTunnelConnector(func(port int) net.Conn {
+		conn, _ := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
+		return conn
+	})
+	cmd := exec.Command(os.Args[1], "-f", "-y", "-q", "-t", "10", os.Args[2])
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = serverInChild, serverOutChild, os.Stderr
+	if err := cmd.Start(); err != nil { fail(err) }
+	_ = serverInChild.Close()
+	_ = serverOutChild.Close()
+	if err := cmd.Wait(); err != nil { fail(err) }
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second): fail(fmt.Errorf("timed out waiting for forked Rust transfer"))
+	}
+	filter.Close()
+	_ = clientInputWriter.Close()
+	expected, err := os.ReadFile(os.Args[2]); if err != nil { fail(err) }
+	actual, err := os.ReadFile(filepath.Join(os.Args[3], filepath.Base(os.Args[2])))
+	if err != nil { fail(err) }
+	if !bytes.Equal(actual, expected) { fail(fmt.Errorf("downloaded bytes differ")) }
+}
+"#,
+    )
+    .expect("write Go tunnel probe");
+    let status = Command::new("go")
+        .args(["build", "-o"])
+        .arg(&output)
+        .arg(&source)
+        .current_dir(go_module)
+        .status()
+        .expect("Go toolchain is required for tunnel interoperability tests");
+    assert!(status.success(), "failed to build Go tunnel probe");
+    output
+}
+
 fn build_go_upload_probe(temp: &Path) -> PathBuf {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let go_module = root.join("trzsz-go");
@@ -38,8 +116,10 @@ fn build_go_upload_probe(temp: &Path) -> PathBuf {
 import (
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
+	"time"
 
 	"github.com/trzsz/trzsz-go/trzsz"
 )
@@ -50,10 +130,14 @@ func fail(err error) {
 }
 
 func main() {
-    if len(os.Args) != 5 {
-        fail(fmt.Errorf("usage: probe upload-file trz-bin destination compress"))
+    if len(os.Args) != 5 && len(os.Args) != 6 {
+        fail(fmt.Errorf("usage: probe upload-file trz-bin destination compress [fork]"))
     }
-    server := exec.Command(os.Args[2], "-y", "-q", "-c", os.Args[4], os.Args[3])
+    serverArgs := []string{"-y", "-q", "-c", os.Args[4], os.Args[3]}
+    if len(os.Args) == 6 && os.Args[5] == "fork" {
+        serverArgs = append([]string{"-f"}, serverArgs...)
+    }
+    server := exec.Command(os.Args[2], serverArgs...)
 	serverIn, err := server.StdinPipe()
 	if err != nil { fail(err) }
 	serverOut, err := server.StdoutPipe()
@@ -63,6 +147,12 @@ func main() {
 	clientInput, clientInputWriter := io.Pipe()
 	filter := trzsz.NewTrzszFilter(clientInput, os.Stdout, serverIn, serverOut,
 		trzsz.TrzszOptions{TerminalColumns: 80})
+	if len(os.Args) == 6 && os.Args[5] == "fork" {
+		filter.SetTunnelConnector(func(port int) net.Conn {
+			conn, _ := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
+			return conn
+		})
+	}
 	result, err := filter.OneTimeUpload([]string{os.Args[1]})
 	if err != nil {
 		filter.Close()
@@ -312,6 +402,22 @@ fn go_filter_uploads_zstd_stream_to_rust_trz() {
         );
         assert_eq!(std::fs::read(destination.join(&name)).unwrap(), expected);
     }
+
+    let name = "go-source-fork.bin";
+    let upload = temp.path().join(name);
+    let destination = temp.path().join("received-fork");
+    std::fs::create_dir_all(&destination).unwrap();
+    std::fs::write(&upload, &expected).unwrap();
+    let status = Command::new(&go_probe)
+        .arg(&upload)
+        .arg(env!("CARGO_BIN_EXE_trz"))
+        .arg(&destination)
+        .arg("no")
+        .arg("fork")
+        .status()
+        .expect("run Go tunnel/fork upload probe");
+    assert!(status.success(), "Go tunnel/fork upload probe failed");
+    assert_eq!(std::fs::read(destination.join(name)).unwrap(), expected);
 }
 
 fn build_go_directory_upload_probe(temp: &Path) -> PathBuf {
@@ -468,4 +574,25 @@ fn go_v4_directory_archive_interoperates_both_directions() {
         .expect("run Go directory upload probe");
     assert!(status.success(), "Go directory upload probe failed");
     assert_received_archive(&upload, &expected);
+}
+#[test]
+fn go_filter_tunnel_receives_forked_rust_tsz() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("forked-source.bin");
+    let expected = (0..512 * 1024).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+    std::fs::write(&source, &expected).unwrap();
+    let download = temp.path().join("downloads");
+    std::fs::create_dir_all(&download).unwrap();
+    let probe = build_go_tunnel_probe(temp.path());
+    let status = Command::new(probe)
+        .arg(env!("CARGO_BIN_EXE_tsz"))
+        .arg(&source)
+        .arg(&download)
+        .status()
+        .expect("run Go tunnel interoperability probe");
+    assert!(status.success(), "Go tunnel/fork probe failed");
+    assert_eq!(
+        std::fs::read(download.join("forked-source.bin")).unwrap(),
+        expected
+    );
 }

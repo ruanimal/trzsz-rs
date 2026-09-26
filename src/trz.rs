@@ -23,7 +23,7 @@ SOFTWARE.
 */
 
 use std::io::{self, Read, Write};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::args::TrzArgs;
@@ -126,14 +126,15 @@ pub fn trz_main(args: &TrzArgs) -> i32 {
         % 10_000_000_000)
         * 100;
 
+    let (tunnel_listener, tunnel_port) = comm::listen_for_tunnel();
     let mode = if args.base.effective_directory() {
         "D"
     } else {
         "R"
     };
     let header = format!(
-        "\x1b[s::TRZSZ:TRANSFER:{}:{}:{:013}:0\r\n",
-        mode, TRZSZ_VERSION, unique_id
+        "\x1b[s::TRZSZ:TRANSFER:{}:{}:{:013}:{}\r\n",
+        mode, TRZSZ_VERSION, unique_id, tunnel_port
     );
     let _ = io::stdout().write_all(header.as_bytes());
     let _ = io::stdout().flush();
@@ -148,6 +149,9 @@ pub fn trz_main(args: &TrzArgs) -> i32 {
 
     // Setup transfer
     let mut transfer = TrzszTransfer::new(Box::new(io::stdout()));
+    if let Some(listener) = tunnel_listener {
+        transfer.accept_on_tunnel(listener, format!("{:013}", unique_id), tunnel_port);
+    }
     transfer.transfer_config.bufsize = args
         .base
         .parse_bufsize()
@@ -174,14 +178,32 @@ pub fn trz_main(args: &TrzArgs) -> i32 {
         }
     });
 
-    // Handle signals
+    // The first interrupt pauses V3+ transfers, the second resumes, and a
+    // subsequent interrupt stops the transfer.
     let stop_handle = transfer.stop_handle();
-    ctrlc::set_handler(move || {
-        stop_handle.store(true, Ordering::SeqCst);
+    let (pause_handle, pause_idx, pause_supported) = transfer.pause_handles();
+    let signal_count = Arc::new(AtomicU8::new(0));
+    let count = signal_count.clone();
+    ctrlc::set_handler(move || match count.fetch_add(1, Ordering::SeqCst) {
+        0 => {
+            if !pause_supported.load(Ordering::SeqCst) {
+                stop_handle.store(true, Ordering::SeqCst);
+            } else if !pause_handle.swap(true, Ordering::SeqCst) {
+                pause_idx.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        1 => {
+            if pause_supported.load(Ordering::SeqCst) {
+                pause_handle.store(false, Ordering::SeqCst);
+            } else {
+                stop_handle.store(true, Ordering::SeqCst);
+            }
+        }
+        _ => stop_handle.store(true, Ordering::SeqCst),
     })
     .ok();
 
-    let mut progress = if args.base.quiet {
+    let mut progress = if args.base.quiet || args.base.fork {
         None
     } else {
         let writer: Arc<Mutex<dyn Write + Send>> = Arc::new(Mutex::new(io::stderr()));
@@ -266,9 +288,10 @@ fn recv_files(
     .unwrap_or(serde_json::Value::Null);
 
     transfer.transfer_config.binary = binary;
+    transfer.transfer_config.fork = args.base.fork;
     transfer.transfer_config.tmux_output_junk = tmux_mode == comm::TmuxMode::Normal;
     transfer.send_config(
-        args.base.quiet,
+        args.base.quiet || args.base.fork,
         binary,
         directory,
         args.base.overwrite,

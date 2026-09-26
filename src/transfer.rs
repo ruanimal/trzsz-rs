@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::Arc;
 #[cfg(not(target_has_atomic = "64"))]
 use std::sync::Mutex;
 #[cfg(target_has_atomic = "64")]
@@ -181,6 +182,9 @@ pub struct TrzszTransfer {
     pub stopped: AtomicBool,
     pub stop_and_delete: AtomicBool,
     pub term_reseted: AtomicBool,
+    pub(crate) pausing: Arc<AtomicBool>,
+    pub(crate) pause_idx: Arc<AtomicU32>,
+    pause_supported: Arc<AtomicBool>,
     pub clean_timeout: Duration,
     #[cfg(target_has_atomic = "64")]
     pub last_input_time: AtomicI64,
@@ -196,18 +200,24 @@ pub struct TrzszTransfer {
     pub peer_lang: String,
     pub created_files: Vec<String>,
     pub tunnel_connected: bool,
+    tunnel_tx: mpsc::SyncSender<std::net::TcpStream>,
+    tunnel_rx: mpsc::Receiver<std::net::TcpStream>,
     pub bg_chan: mpsc::SyncSender<()>,
 }
 
 impl TrzszTransfer {
     pub fn new(writer: Box<dyn Write + Send>) -> Self {
         let (bg_tx, _) = mpsc::sync_channel(1);
+        let (tunnel_tx, tunnel_rx) = mpsc::sync_channel(1);
         TrzszTransfer {
             buffer: TrzszBuffer::new(),
             writer,
             stopped: AtomicBool::new(false),
             stop_and_delete: AtomicBool::new(false),
             term_reseted: AtomicBool::new(false),
+            pausing: Arc::new(AtomicBool::new(false)),
+            pause_idx: Arc::new(AtomicU32::new(0)),
+            pause_supported: Arc::new(AtomicBool::new(false)),
             clean_timeout: Duration::from_millis(100),
             #[cfg(target_has_atomic = "64")]
             last_input_time: AtomicI64::new(0),
@@ -228,6 +238,8 @@ impl TrzszTransfer {
             created_files: Vec::new(),
             peer_lang: String::new(),
             tunnel_connected: false,
+            tunnel_tx,
+            tunnel_rx,
             bg_chan: bg_tx,
         }
     }
@@ -236,6 +248,64 @@ impl TrzszTransfer {
         let _ = self.bg_chan.clone(); // keep sender alive
         let (_, rx) = mpsc::sync_channel(1);
         rx
+    }
+
+    pub(crate) fn accept_on_tunnel(
+        &mut self,
+        listener: std::net::TcpListener,
+        unique_id: String,
+        port: i32,
+    ) {
+        let tx = self.tunnel_tx.clone();
+        let input = self.buffer.sender();
+        std::thread::spawn(move || {
+            let uid = unique_id.strip_suffix("00").unwrap_or(&unique_id);
+            let client_hello = format!("::TRZSZ::CLIENT::HELLO::{}:{}", uid, port);
+            let server_hello = format!("::TRZSZ::SERVER::HELLO::{}:{}", uid, port);
+            let (stream, mut reader) = loop {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut hello = vec![0; client_hello.len()];
+                if std::io::Read::read_exact(&mut stream, &mut hello).is_err()
+                    || hello != client_hello.as_bytes()
+                    || std::io::Write::write_all(&mut stream, server_hello.as_bytes()).is_err()
+                {
+                    continue;
+                }
+                let Ok(reader) = stream.try_clone() else {
+                    continue;
+                };
+                break (stream, reader);
+            };
+            if tx.send(stream).is_err() {
+                return;
+            }
+            let mut buf = [0u8; 32 * 1024];
+            loop {
+                match std::io::Read::read(&mut reader, &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if input.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn switch_to_tunnel(&mut self) -> Result<(), TrzszError> {
+        let stream = self
+            .tunnel_rx
+            .try_recv()
+            .map_err(|_| crate::comm::simple_error("Tunnel connection was not established"))?;
+        let writer = stream
+            .try_clone()
+            .map_err(|e| crate::comm::simple_trzsz_error("Clone tunnel connection failed", e))?;
+        self.writer = Box::new(writer);
+        self.tunnel_connected = true;
+        Ok(())
     }
 
     pub fn add_received_data(&self, buf: &[u8], _tunnel: bool) {
@@ -258,7 +328,13 @@ impl TrzszTransfer {
         self.stopped.store(true, Ordering::SeqCst);
         self.buffer.stop();
     }
-
+    pub(crate) fn pause_handles(&self) -> (Arc<AtomicBool>, Arc<AtomicU32>, Arc<AtomicBool>) {
+        (
+            self.pausing.clone(),
+            self.pause_idx.clone(),
+            self.pause_supported.clone(),
+        )
+    }
     pub(crate) fn stop_handle(&self) -> std::sync::Arc<AtomicBool> {
         self.buffer.stop_handle()
     }
@@ -320,26 +396,48 @@ impl TrzszTransfer {
         may_has_junk: bool,
         timeout: Option<Instant>,
     ) -> Result<String, TrzszError> {
-        let line = self.recv_line(expect_type, may_has_junk, timeout)?;
-        let idx = line
-            .iter()
-            .position(|&b| b == b':')
-            .filter(|&idx| idx >= 1)
-            .ok_or_else(|| TrzszError {
+        let v3 = self.transfer_config.protocol >= 3;
+        let mut next_timeout = timeout;
+        loop {
+            while v3 && self.pausing.load(Ordering::SeqCst) {
+                self.check_stop()?;
+                std::thread::sleep(Duration::from_millis(100));
+                next_timeout = self.get_new_timeout();
+            }
+            let pause_idx = self.pause_idx.load(Ordering::SeqCst);
+            let line = match self.recv_line(expect_type, may_has_junk, next_timeout) {
+                Ok(line) => line,
+                Err(error)
+                    if v3
+                        && error.message == crate::comm::ERR_RECEIVE_DATA_TIMEOUT.message
+                        && pause_idx < self.pause_idx.load(Ordering::SeqCst) =>
+                {
+                    next_timeout = self.get_new_timeout();
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let idx = line.iter().position(|&b| b == b':').filter(|&idx| idx >= 1);
+            let idx = idx.ok_or_else(|| TrzszError {
                 message: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &line),
                 err_type: "colon".to_string(),
                 trace: true,
             })?;
-        let typ = String::from_utf8_lossy(&line[1..idx]).into_owned();
-        let buf = String::from_utf8_lossy(&line[idx + 1..]).into_owned();
-        if typ != expect_type {
-            return Err(TrzszError {
-                message: buf,
-                err_type: typ,
-                trace: true,
-            });
+            let typ = String::from_utf8_lossy(&line[1..idx]).into_owned();
+            let buf = String::from_utf8_lossy(&line[idx + 1..]).into_owned();
+            if v3 && buf == "=" {
+                next_timeout = self.get_new_timeout();
+                continue;
+            }
+            if typ != expect_type {
+                return Err(TrzszError {
+                    message: buf,
+                    err_type: typ,
+                    trace: true,
+                });
+            }
+            return Ok(buf);
         }
-        Ok(buf)
     }
     pub(crate) fn recv_check_limited(
         &mut self,
@@ -348,33 +446,54 @@ impl TrzszTransfer {
         timeout: Option<Instant>,
         max_line_size: usize,
     ) -> Result<String, TrzszError> {
-        self.check_stop()?;
-        let may_has_junk = may_has_junk || self.transfer_config.tmux_output_junk;
-        let line = self.buffer.read_line_for_limited(
-            Some(expect_type),
-            may_has_junk,
-            timeout,
-            max_line_size,
-        )?;
-        let idx = line
-            .iter()
-            .position(|&byte| byte == b':')
-            .filter(|&idx| idx >= 1)
-            .ok_or_else(|| TrzszError {
+        let v3 = self.transfer_config.protocol >= 3;
+        let mut next_timeout = timeout;
+        loop {
+            self.check_stop()?;
+            while v3 && self.pausing.load(Ordering::SeqCst) {
+                self.check_stop()?;
+                std::thread::sleep(Duration::from_millis(100));
+                next_timeout = self.get_new_timeout();
+            }
+            let pause_idx = self.pause_idx.load(Ordering::SeqCst);
+            let line = match self.buffer.read_line_for_limited(
+                Some(expect_type),
+                may_has_junk || self.transfer_config.tmux_output_junk,
+                next_timeout,
+                max_line_size,
+            ) {
+                Ok(line) => line,
+                Err(error)
+                    if v3
+                        && error.message == crate::comm::ERR_RECEIVE_DATA_TIMEOUT.message
+                        && pause_idx < self.pause_idx.load(Ordering::SeqCst) =>
+                {
+                    next_timeout = self.get_new_timeout();
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let idx = line.iter().position(|&b| b == b':').filter(|&idx| idx >= 1);
+            let idx = idx.ok_or_else(|| TrzszError {
                 message: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &line),
                 err_type: "colon".to_string(),
                 trace: true,
             })?;
-        let typ = String::from_utf8_lossy(&line[1..idx]).into_owned();
-        let payload = String::from_utf8_lossy(&line[idx + 1..]).into_owned();
-        if typ != expect_type {
-            return Err(TrzszError {
-                message: payload,
-                err_type: typ,
-                trace: true,
-            });
+            let typ = String::from_utf8_lossy(&line[1..idx]).into_owned();
+            let payload = String::from_utf8_lossy(&line[idx + 1..]).into_owned();
+            if v3 && payload == "=" {
+                next_timeout = self.get_new_timeout();
+                continue;
+            }
+            if typ != expect_type {
+                return Err(TrzszError {
+                    message: payload,
+                    err_type: typ,
+                    trace: true,
+                });
+            }
+            return Ok(payload);
         }
-        Ok(payload)
     }
 
     pub fn send_integer(&mut self, typ: &str, val: i64) -> Result<(), TrzszError> {
@@ -569,6 +688,9 @@ impl TrzszTransfer {
         }
         self.transfer_config.newline = action.newline.clone();
         self.peer_lang = action.lang.clone();
+        if action.tunnel {
+            self.switch_to_tunnel()?;
+        }
         Ok(action)
     }
 
@@ -590,9 +712,16 @@ impl TrzszTransfer {
         if quiet {
             cfg_map["quiet"] = serde_json::json!(true);
         }
+        if action.tunnel {
+            cfg_map["binary"] = serde_json::json!(true);
+            if self.transfer_config.fork {
+                cfg_map["fork"] = serde_json::json!(true);
+                cfg_map["quiet"] = serde_json::json!(true);
+            }
+        }
         if binary {
             cfg_map["binary"] = serde_json::json!(true);
-            if !escape_chars.is_null() {
+            if !action.tunnel && !escape_chars.is_null() {
                 cfg_map["escape_chars"] = escape_chars.clone();
             }
         }
@@ -624,6 +753,8 @@ impl TrzszTransfer {
             err_type: String::new(),
             trace: false,
         })?;
+        self.pause_supported
+            .store(self.transfer_config.protocol >= 3, Ordering::SeqCst);
         let cfg_str = serde_json::to_string(&cfg_map).unwrap_or_default();
         self.send_string("CFG", &cfg_str)
     }
@@ -637,6 +768,8 @@ impl TrzszTransfer {
         })?;
         self.peer_lang = config.lang.clone();
         self.transfer_config = config.clone();
+        self.pause_supported
+            .store(config.protocol >= 3, Ordering::SeqCst);
         Ok(config)
     }
 
@@ -1401,6 +1534,28 @@ mod tests {
     }
 
     #[test]
+    fn pause_support_is_enabled_only_for_protocol_v3_and_later() {
+        let mut transfer = TrzszTransfer::new(Box::new(std::io::sink()));
+        let mut action = TransferAction::default();
+        for (protocol, expected) in [(2, false), (3, true)] {
+            action.protocol = protocol;
+            transfer
+                .send_config(
+                    false,
+                    false,
+                    false,
+                    false,
+                    &serde_json::Value::Null,
+                    0,
+                    &action,
+                    CompressType::Auto,
+                )
+                .unwrap();
+            assert_eq!(transfer.pause_supported.load(Ordering::SeqCst), expected);
+        }
+    }
+
+    #[test]
     fn v4_archives_only_when_not_overwriting() {
         fn source(path_id: i32, name: &str, is_dir: bool) -> SourceFile {
             SourceFile {
@@ -1487,5 +1642,45 @@ mod tests {
             assert_eq!(result.is_err(), should_fail);
             assert!(closed.load(Ordering::SeqCst));
         }
+    }
+    #[test]
+    fn tunnel_handshake_routes_protocol_over_tcp() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port() as i32;
+        let unique_id = "1234567890100".to_string();
+        let uid = unique_id[..unique_id.len() - 2].to_string();
+        let mut transfer = TrzszTransfer::new(Box::new(std::io::sink()));
+        transfer.accept_on_tunnel(listener, unique_id, port);
+
+        let peer = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut invalid = std::net::TcpStream::connect(("127.0.0.1", port as u16)).unwrap();
+            invalid.write_all(b"bad hello").unwrap();
+            drop(invalid);
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port as u16)).unwrap();
+            let client_hello = format!("::TRZSZ::CLIENT::HELLO::{}:{}", uid, port);
+            let server_hello = format!("::TRZSZ::SERVER::HELLO::{}:{}", uid, port);
+            stream.write_all(client_hello.as_bytes()).unwrap();
+            let mut response = vec![0; server_hello.len()];
+            stream.read_exact(&mut response).unwrap();
+            assert_eq!(response, server_hello.as_bytes());
+            let action = serde_json::json!({
+                "lang": "go", "confirm": true, "newline": "\n",
+                "tunnel": true, "fork": true
+            })
+            .to_string();
+            let line = format!("#ACT:{}\n", crate::escape::encode_string(&action));
+            stream.write_all(line.as_bytes()).unwrap();
+            let mut response = vec![0; b"#CFG:ready\n".len()];
+            stream.read_exact(&mut response).unwrap();
+            assert_eq!(response, b"#CFG:ready\n");
+        });
+
+        let action = transfer.recv_action().unwrap();
+        assert!(action.tunnel);
+        assert!(action.fork);
+        assert!(transfer.tunnel_connected);
+        transfer.send_line("CFG", "ready").unwrap();
+        peer.join().unwrap();
     }
 }

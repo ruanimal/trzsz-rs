@@ -19,6 +19,18 @@ const COMPRESSION_SAMPLE_SIZE: usize = 128 * 1024;
 const MAX_ZSTD_WINDOW_LOG: u32 = 27;
 const MAX_V2_WIRE_FRAME_SIZE: usize = 64 * 1024 * 1024;
 
+fn wait_for_resume(transfer: &mut TrzszTransfer) -> Result<(), TrzszError> {
+    if transfer.transfer_config.protocol < 3 {
+        return transfer.check_stop();
+    }
+    while transfer.pausing.load(std::sync::atomic::Ordering::SeqCst) {
+        transfer.check_stop()?;
+        transfer.send_line("DATA", "=")?;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    transfer.check_stop()
+}
+
 pub(crate) fn send_file_data(
     transfer: &mut TrzszTransfer,
     file: &mut dyn FileReader,
@@ -359,7 +371,7 @@ impl<'t, 'p, 'c> FrameWriter<'t, 'p, 'c> {
         while self.pending.len() >= ACK_WINDOW {
             self.recv_chunk_ack()?;
         }
-        self.transfer.check_stop()?;
+        wait_for_resume(self.transfer)?;
         let newline = self.transfer.transfer_config.newline.clone();
         if self.binary {
             self.transfer
@@ -861,5 +873,157 @@ mod tests {
         )
         .unwrap();
         assert_eq!(digest, Md5::digest(data).to_vec());
+    }
+    #[test]
+    fn v3_receiver_ignores_pause_heartbeats_and_resumes() {
+        let mut transfer = TrzszTransfer::new(Box::new(io::sink()));
+        transfer.transfer_config.protocol = 3;
+        transfer.transfer_config.timeout = 0;
+        transfer
+            .pausing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        transfer
+            .pause_idx
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let paused = transfer.pausing.clone();
+        let input = transfer.buffer.sender();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            result_tx
+                .send(transfer.recv_check("SUCC", false, None))
+                .unwrap();
+        });
+        thread::sleep(Duration::from_millis(120));
+        assert!(result_rx.try_recv().is_err());
+        paused.store(false, std::sync::atomic::Ordering::SeqCst);
+        input.send(b"#DATA:=\n#SUCC:3/3\n".to_vec()).unwrap();
+        assert_eq!(result_rx.recv().unwrap().unwrap(), "3/3");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn protocol2_does_not_ignore_pause_marker() {
+        let mut transfer = TrzszTransfer::new(Box::new(io::sink()));
+        transfer.transfer_config.protocol = 2;
+        transfer.add_received_data(b"#DATA:=\n#SUCC:1\n", false);
+        let error = transfer.recv_check("SUCC", false, None).unwrap_err();
+        assert_eq!(error.err_type, "DATA");
+    }
+
+    #[test]
+    fn v3_receiver_can_be_cancelled_while_paused() {
+        let mut transfer = TrzszTransfer::new(Box::new(io::sink()));
+        transfer.transfer_config.protocol = 3;
+        transfer.transfer_config.timeout = 0;
+        transfer
+            .pausing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        transfer
+            .pause_idx
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let stop = transfer.stop_handle();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            result_tx
+                .send(transfer.recv_check("SUCC", false, None))
+                .unwrap();
+        });
+        thread::sleep(Duration::from_millis(120));
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            result_rx
+                .recv()
+                .unwrap()
+                .unwrap_err()
+                .message
+                .contains("Stopped")
+        );
+        worker.join().unwrap();
+    }
+    struct TestSource(std::io::Cursor<Vec<u8>>);
+
+    impl FileReader for TestSource {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            Read::read(&mut self.0, buf)
+        }
+
+        fn size(&self) -> i64 {
+            self.0.get_ref().len() as i64
+        }
+
+        fn close(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn v3_file_data_resumes_with_intact_bytes_and_digest() {
+        let expected = (0..5_017).map(|n| (n % 251) as u8).collect::<Vec<_>>();
+        let output = CaptureWriter::default();
+        let captured = output.0.clone();
+        let mut transfer = TrzszTransfer::new(Box::new(output));
+        transfer.transfer_config.protocol = 3;
+        transfer.transfer_config.compress = CompressType::No as i32;
+        transfer.transfer_config.bufsize = 1024;
+        transfer.transfer_config.timeout = 0;
+        transfer
+            .pausing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        transfer
+            .pause_idx
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let paused = transfer.pausing.clone();
+        let input = transfer.buffer.sender();
+        let peer_output = captured.clone();
+        let peer_expected = expected.clone();
+        let peer = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut offset = 0;
+            let mut received = Vec::new();
+            loop {
+                let wire = peer_output.lock().unwrap().clone();
+                let Some(relative_end) = wire[offset..].iter().position(|&b| b == b'\n') else {
+                    assert!(Instant::now() < deadline, "timed out waiting for DATA");
+                    drop(wire);
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                };
+                let end = offset + relative_end;
+                let line = &wire[offset..end];
+                offset = end + 1;
+                if !line.starts_with(b"#DATA:") || line == b"#DATA:=" {
+                    continue;
+                }
+                let payload = &line[b"#DATA:".len()..];
+                let frame = BASE64.decode(payload).unwrap();
+                received.extend_from_slice(&frame);
+                let ack = format!("#SUCC:{}/{}\n", payload.len(), received.len());
+                input.send(ack.into_bytes()).unwrap();
+                if frame.is_empty() {
+                    assert_eq!(received, peer_expected);
+                    input
+                        .send(format!("#SUCC:{}\n", peer_expected.len()).into_bytes())
+                        .unwrap();
+                    break;
+                }
+            }
+        });
+
+        let mut source = TestSource(std::io::Cursor::new(expected.clone()));
+        let worker =
+            thread::spawn(move || send_file_data(&mut transfer, &mut source, &mut None).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !captured
+            .lock()
+            .unwrap()
+            .windows(b"#DATA:=\n".len())
+            .any(|window| window == b"#DATA:=\n")
+        {
+            assert!(Instant::now() < deadline, "pause heartbeat was not sent");
+            thread::sleep(Duration::from_millis(2));
+        }
+        paused.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(worker.join().unwrap(), Md5::digest(&expected).to_vec());
+        peer.join().unwrap();
     }
 }

@@ -6,11 +6,12 @@
 
 - **Roadmap 第 1 步 / 传输 P0：已完成**（实现见提交 `06ab606`）：修复 Latin-1 转义、收发数据零进展、畸形协议行、`-r`、binary 降级及 `tmux_output_junk`。
 - **剩余传输 P1：已完成**：接收文件/目录按 Go 的 `perm | 0600` / `perm | 0700` 创建；停止删除兼容普通文件和目录；发送/接收句柄在成功、失败路径均 close；逐 DATA chunk 调用进度回调，`trz`/`tsz` 接入 stderr 进度条；Ctrl+C 通过共享 stop 状态唤醒 buffer 等待。
-- V2 流水线、zstd 流编码/解码及 protocol 1 回退已实现；V2 每文件使用有界 DATA 窗口（最多 5 帧在途），文本流使用 Base64，binary 流使用 escape，文件结束后继续执行原 MD5 校验。Rust 最高声明 protocol 4。
+- **V3+ 暂停/恢复已实现**：V3+ Ctrl+C 首次暂停、再次恢复、之后停止；V1/V2 仍直接停止。Go 的确认停止/删除交互菜单未移植。
+- V2 流水线、zstd 流编码/解码及 protocol 1 回退已实现；V2 每文件使用有界 DATA 窗口（最多 5 帧在途），文本流使用 Base64，binary 流使用 escape，文件结束后继续执行原 MD5 校验。V3+ 支持 Go 兼容 `#DATA:=` 暂停心跳；V1/V2 不启用暂停。Rust 最高声明 protocol 4。
 - **V3 HASH 断点续传已实现**：按 10 MiB 累积 MD5 checkpoint 协商，匹配前缀后从末端继续；摘要不匹配时保留最后一个匹配 checkpoint 并重传其后内容。Rust protocol 3 保留 HASH 前的整数 `SIZE` 行；Go V4 的 HASH 使用 NAME 中的源尺寸、不交换此整数行，Rust V4 已对齐。
 - **V4 目录归档已实现**：同一 `path_id` 的目录子项在非覆盖模式下聚合为单个归档 DATA 流；覆盖模式和 protocol 1–3 保持 Go 的非归档行为。
-- **真实 Go V4 双向互通已验证**：`tests/v3_go_interop.rs` 自行构建仓库 `trzsz-go` filter/probe，覆盖文件压缩选择/HASH 续传和 Rust `tsz` → Go 下载、Go `OneTimeUpload` → Rust `trz` 目录归档双向传输。
-- 回归覆盖：`tests/transfer_e2e.rs` 明确以 protocol 3 覆盖 HASH 续传、旧目录流，并测试 V4 目录归档；`src/v3.rs` 覆盖 V3/V4 HASH 的 `SIZE` 差异；`src/archive.rs` 覆盖分块边界、Unicode、空目录/空文件及无效/截断头；protocol 1 旧线格式由 `tests/protocol_minimal.rs` 验证。
+- **真实 Go V4 双向互通已验证**：`tests/v3_go_interop.rs` 自行构建仓库 `trzsz-go` filter/probe，覆盖压缩选择/HASH 续传、目录归档，以及 Go filter 显式设置 tunnel connector 后的 Rust `tsz -f` 下载和 Go `OneTimeUpload` → Rust `trz -f` 上传。
+- 回归覆盖：除既有 HASH/归档测试外，`src/transfer.rs` 覆盖本地 TCP tunnel hello/ACT/CFG 切换及 protocol 2/3 暂停能力门控；`src/v2.rs` 覆盖 pause heartbeat、恢复后的文件字节/MD5 完整性和暂停时取消；真实 Go filter probe 覆盖 `trz -f`/`tsz -f` 双向传输。
 - **协议边界说明**：Go protocol 2（`Protocol < 3`）固定 `compress = !binary`，不交换 `COMP`，也不应用 CFG `compress`；V3 的 `yes/no` 由 CFG 选择，`auto` 在 size <512 时不压缩、512 B ≤ size <128 KiB 固定压缩，size ≥128 KiB 采样后交换 `#COMP:true/false`。Rust V3 对 Go peer 遵循该规则；Go protocol 2 的 `-c no` 仍无法由 Rust 端覆盖。
 **范围**：只看 `trz`/`tsz` 与对端之间的文件传输协议与实现，即 `src/transfer.rs`、`src/v2.rs`、`src/buffer.rs`、`src/escape.rs`、`src/comm.rs`（路径/校验部分）、`src/progress.rs`、`src/trz.rs`、`src/tsz.rs` 的传输流程。
 **明确排除**：`trzsz` 包装器（ssh/pty/数据泵）、relay、拖拽上传、zmodem、OSC52、文件选择对话框等非传输项。
@@ -106,7 +107,7 @@ Go `handleServerSignal`：SIGINT/SIGTERM → `stopTransferringFiles(false)`（`c
 
 ## 二、协议能力进度（Go = V4，Rust = V4）
 
-`K_PROTOCOL_VERSION` 现为 4；Rust 在 ACT 声明最高 V4，发送 CFG 时取 `min(action.protocol, 4)`。协商为 1 时仍进入原 stop-and-wait V1 路径；V2 提供流式 DATA 与有限 ACK 窗口；V3 增加 HASH 续传和 Go 兼容 COMP 协商；V4 增加目录归档。隧道/fork 与暂停/恢复仍未实现。
+`K_PROTOCOL_VERSION` 现为 4；Rust 在 ACT 声明最高 V4，发送 CFG 时取 `min(action.protocol, 4)`。协商为 1 时仍进入原 stop-and-wait V1 路径；V2 提供流式 DATA 与有限 ACK 窗口；V3 增加 HASH 续传、Go 兼容 COMP 协商及暂停/恢复心跳；V4 增加目录归档。隧道/fork 已接入 CLI。
 
 | 能力 | Go | Rust | 用户可见影响 |
 |---|---|---|---|
@@ -115,11 +116,11 @@ Go `handleServerSignal`：SIGINT/SIGTERM → `stopTransferringFiles(false)`（`c
 | **V1 回退** | protocol 小于 2 使用旧逐块 DATA/单整数 ACK | 收到 protocol 1 CFG 仍使用原 zlib+Base64 / binary 线格式及 stop-and-wait | 老对端不接收 V2 DATA 流，保持旧行为 |
 | **断点续传 HASH** | V3 使用 10 MiB 累积 MD5 checkpoint；V4 仍按同样 checkpoint 匹配，但从 NAME 的源 `size` 取尺寸，不交换整数 `SIZE` 行（`append.go:162-205,255-320`） | **已实现**：protocol 3 保留整数 `SIZE` 行；protocol 4 从 NAME 的 `size` 取源尺寸并省略该行；HASH/SUCC 校验、失配后截断到最后匹配点 | 老 V3 行为不变；Go V4 文件续传与 Go peer 兼容 |
 | **V4 目录归档** | V4 非覆盖模式将同 `path_id` 项打包为单个 NAME/DATA；归档流由每项的 base64(zlib(SourceFile JSON)) 行、后接其文件字节构成（`archive.go:81-94,106-185`）。覆盖模式不归档 | **已实现**：非覆盖 V4 按 `path_id` 聚合；归档 DATA reader/writer 维持 Go 线格式，跨任意 chunk 解码；归档不走 HASH，目标 SIZE 为 0；覆盖模式与 protocol 1–3 不聚合 | 目录树语义不变，减少目录中每个子项单独的 NAME/SIZE/MD5 协商 |
-| **暂停/恢复** | V3 `#DATA:=` / `pausing`/`pauseIdx`（`pipeline.go:340-406`） | 无 | 无法在进行中的传输中暂停；HASH 断点续传不等同于暂停 |
-| **隧道 + fork 后台** | `listenForTunnel` 发真实端口 + hello 握手 + `switchToBackground`（`comm.go:991-997`、`transfer.go:154-250`） | 端口写死 `0`（`trz.rs:121` / `tsz.rs:117`）、`listen_for_tunnel` 无人调用、`background()` 返回永不触发的 receiver（`transfer.rs:220-224`，且 `transfer.rs:190` 的接收端当场丢弃） | **`-f` 必然失败**："The client doesn't support fork to background" |
+| **暂停/恢复** | V3 `#DATA:=` / `pausing`/`pauseIdx`（`pipeline.go:340-406`） | **已实现**：V3+ 发送 DATA 前等待恢复并每 100 ms 发 `#DATA:=`；接收端跳过该心跳；Ctrl+C 首次暂停、再次恢复、之后停止；V1/V2 保持直接停止 | 文件传输可暂停后续传并保持最终 MD5；Rust 暂未移植 Go 的确认停止/删除交互菜单 |
+| **隧道 + fork 后台** | loopback listener 在触发头公布端口；`CLIENT/SERVER HELLO` 握手；ACT 标记 tunnel/support fork；CFG fork 后切后台 | **CLI 已实现**：`trz`/`tsz` 触发头公布动态 loopback 端口；验证 Go hello 后将 tunnel 输入并入缓冲区；ACT 协商后切换协议 writer；Unix `-f` fork/setsid，CFG 仅在 tunnel 已连且请求 fork 时置 `fork`/`quiet`。非 CLI/library 的 `TrzszTransfer::background()` channel 仍是桩，未用于此 CLI 路径 | 仓库 Go filter 显式配置 `SetTunnelConnector` 后双向真实传输通过；`-f` 当前仅 Unix 支持，Go 的交互式后台确认/终端菜单不在本次范围 |
 | **tmux 输出脏字节** | tmux 普通模式发送 `tmux_output_junk: true`，对端据此启用 `mayHasJunk` + `stripTmuxStatusLine` | **已修复（M0）**：普通 tmux 模式在 CFG 中发送该键，接收行按类型重同步并剥离 tmux 状态行 | 本地回归覆盖；真实 tmux 场景待验证 |
 
-真实 Go V4 双向测试覆盖文件压缩选择、HASH 匹配/不匹配续传和目录归档（嵌套 Unicode 路径、空目录/空文件及独立文件）。Rust 单测覆盖 V3/V4 HASH 的尺寸行差异、归档分块边界和损坏输入；真实 tmux 场景尚未覆盖。
+真实 Go V4 双向测试覆盖文件压缩选择、HASH 匹配/不匹配续传、目录归档，以及显式启用 tunnel connector 的 Rust `tsz -f`/`trz -f`。Rust 单测覆盖暂停心跳、恢复后完整性和取消；真实 tmux 场景尚未覆盖。
 
 ---
 
@@ -166,7 +167,7 @@ Go `handleServerSignal`：SIGINT/SIGTERM → `stopTransferringFiles(false)`（`c
 7. ✅ **P2 / V2 流水线完成** — 流式 zstd、五帧有界 ACK 窗口和 protocol 1 回退；V2 Go peer 仍固定 `!binary`，不收发 COMP。
 8. ✅ **P2 / V3 HASH + COMP 完成** — 实现 10 MiB HASH checkpoint 续传和 Go V3+ `yes/no/auto` COMP 规则；Rust protocol 3 的整数 `SIZE` 线格式及 Go V4 的 NAME-size 规则均有回归。
 9. ✅ **P2 / V4 目录归档完成** — V4 非覆盖模式按 `path_id` 聚合目录条目并以 Go 兼容归档 DATA 流还原；真实 Go 双向互通及 Rust V3 回退测试通过。
-10. ⏳ **后续 P2 待处理** — 隧道/fork 后台；暂停/恢复仍未实现。
+10. ✅ **P2 完成** — 动态 tunnel 端口、Go hello 握手、协议 writer/input 切换、Unix fork/setsid、V3+ pause/resume 心跳及 V1/V2 行为门控；Go filter tunnel 双向实测通过。Go 交互式停止菜单与非 Unix fork 不在实现范围。
 
 ---
 
