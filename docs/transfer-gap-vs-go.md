@@ -13,6 +13,7 @@
 - **真实 Go V4 双向互通已验证**：`tests/v3_go_interop.rs` 自行构建仓库 `trzsz-go` filter/probe，覆盖压缩选择/HASH 续传、目录归档，以及 Go filter 显式设置 tunnel connector 后的 Rust `tsz -f` 下载和 Go `OneTimeUpload` → Rust `trz -f` 上传。
 - 回归覆盖：除既有 HASH/归档测试外，`src/transfer.rs` 覆盖本地 TCP tunnel hello/ACT/CFG 切换及 protocol 2/3 暂停能力门控；`src/v2.rs` 覆盖 pause heartbeat、恢复后的文件字节/MD5 完整性和暂停时取消；真实 Go filter probe 覆盖 `trz -f`/`tsz -f` 双向传输。
 - **协议边界说明**：Go protocol 2（`Protocol < 3`）固定 `compress = !binary`，不交换 `COMP`，也不应用 CFG `compress`；V3 的 `yes/no` 由 CFG 选择，`auto` 在 size <512 时不压缩、512 B ≤ size <128 KiB 固定压缩，size ≥128 KiB 采样后交换 `#COMP:true/false`。Rust V3 对 Go peer 遵循该规则；Go protocol 2 的 `-c no` 仍无法由 Rust 端覆盖。
+- **第三节差异已收敛**：补齐 colon/远端错误载荷、junk 模式 CRLF、当前进程目录写权限、创建 errno 文案、源文件进度名、零文件/绝对路径完成提示；回归覆盖见 `src/buffer.rs`、`src/comm.rs`、`src/transfer.rs`、`tests/transfer_p0.rs` 与 `tests/transfer_p1.rs`。真实 tmux junk 场景仍待验证。
 **范围**：只看 `trz`/`tsz` 与对端之间的文件传输协议与实现，即 `src/transfer.rs`、`src/v2.rs`、`src/buffer.rs`、`src/escape.rs`、`src/comm.rs`（路径/校验部分）、`src/progress.rs`、`src/trz.rs`、`src/tsz.rs` 的传输流程。
 **明确排除**：`trzsz` 包装器（ssh/pty/数据泵）、relay、拖拽上传、zmodem、OSC52、文件选择对话框等非传输项。
 **参考实现**：`trzsz-go` @ `4432ed0`（子模块已检出）。
@@ -129,14 +130,14 @@ Go `handleServerSignal`：SIGINT/SIGTERM → `stopTransferringFiles(false)`（`c
 | 项 | Go | Rust |
 |---|---|---|
 | `recvLine` 脏数据重同步 | `mayHasJunk` 时 `LastIndex("#TYPE:")`，否则取最后一个 `#`（`transfer.go:422-431`） | **已修复（P0）**：按期望类型重同步；启用 junk 时剥离 tmux 状态行 | 本地回归覆盖；真实 tmux junk 场景待验证 |
-| colon 错误载荷 | zlib+base64 编码并加 `[TrzszError] typ:` 前缀，`fail/FAIL/EXIT` 可解（`comm.go:228-248`） | 纯 base64（`transfer.rs:293`），类型不匹配时不解码 → 错误文案乱码 |
-| `\r` 结尾行处理 | append 后检查，若以 `\r` 结尾则截断并继续读（`buffer.go:119-137`） | **append 前**检查 `last()`（`buffer.rs:128-132`）→ 单 chunk `#X:1\r\n` 会留下尾随 `\r` |
+| colon / 远端错误载荷 | 缺少冒号时编码 raw line 并用 `colon` 类型构造错误；类型不匹配时解码 `fail/FAIL/EXIT`（`transfer.go:444-452`） | **已修复**：无有效冒号及类型不匹配均按 Go 构造错误；远端错误载荷解码为可读消息，非法编码保持原载荷；普通与限长读取路径均有本地回归测试 |
+| `\r` 结尾行处理 | junk 模式下完整行追加后检查尾部 `\r`，截断并继续读（`buffer.go:119-137`） | **已修复**：改为追加后检查；单块与跨块 CRLF 协议行均有本地回归测试 |
 | 空 `path_name` | `unmarshalSourceFile` 返回 "Invalid source file"（`comm.go:320-329`） | **已修复（P0）**：空 `rel_path` 返回明确错误，不再索引访问 | 本地回归覆盖 |
-| 创建文件 errno 文案 | "No permission to write" / "Is a directory" / "Not a directory"（`transfer.go:1016-1055`） | 只有 `Create file [x] failed: …` |
-| 目标目录可写检查 | `faccessat(W_OK)` 按当前 uid（`comm.go:276-290`） | 只看 owner 写位（`comm.rs:224-230`，`!mode & 0o200 != 0` 语义碰巧正确但绕） |
-| 进度显示的文件名 | 报源文件名（`transfer.go:1151-1153`） | 报 `local_name`（`transfer.rs:786-788`）→ 改名/目录模式下显示不同 |
-| 完成提示 | `"Saved N … to X"` + `"\r\n- "` 分隔（`comm.go:950-978`） | `"No file saved"` + `"\n"` 分隔（`comm.rs:487-510`） |
-| 保存路径 | 用 `filepath.Abs` 后的绝对路径 | `recv_files` 传的是**原始相对** `args.path`（`trz.rs:223`，canonicalize 结果只用于校验）→ 提示显示相对路径 |
+| 创建文件 errno 文案 | `EACCES` / `EISDIR` / `ENOTDIR` 分别返回 "No permission to write" / "Is a directory" / "Not a directory"（`transfer.go:1016-1055`） | **已修复**：按对应 `io::ErrorKind` 映射；三种分类均有本地测试 |
+| 目标目录可写检查 | `faccessat(W_OK)` 按当前 uid（`comm.go:276-290`） | **已修复**：Unix 使用 `libc::access(W_OK)` 按当前进程权限判定，并有 W_OK 对照回归测试 |
+| 进度显示的文件名 | 报源文件名（`transfer.go:1151-1153`） | **已修复**：使用接收 NAME 中的源文件名；本地目录重名映射回归验证 |
+| 完成提示 | `Saved N … to X`；零文件仍显示 `Saved 0 file/directory`，列表用 `\r\n- ` 分隔（`comm.go:950-978`） | **已修复**：零文件/文件列表格式与 Go 一致；本地单测覆盖 |
+| 保存路径 | 用 `filepath.Abs` 后的绝对路径 | **已修复**：canonicalize 后的绝对目标路径传入接收流程，并用于完成提示 |
 | `targetFile`（V3 用） | `NAME` 响应携带目标名和已有文件大小；Go 校验负 size（`comm.go:336-353`） | V3 已解析 target 并用 size 启动 HASH 续传，拒绝负 size |
 | 重名检测 `-y` | `filepath.Join(RelPath...)`（`comm.go:425-435`） | `rel_path.join("/")`（`comm.rs:351-360`，Unix 等价） |
 
@@ -144,7 +145,7 @@ Go `handleServerSignal`：SIGINT/SIGTERM → `stopTransferringFiles(false)`（`c
 
 ## 四、实测通过、与 Go 行为一致的部分
 
-- **目录上传**：`trz -d` 收到 `path_name:["subdir"]` 和 `["subdir","a.txt"]`，正确建出 `subdir/a.txt`，内容与 MD5 全对 ✅（唯一问题是权限）
+- **目录上传**：`trz -d` 收到 `path_name:["subdir"]` 和 `["subdir","a.txt"]`，正确建出 `subdir/a.txt`，内容与 MD5 全对；接收端目录/文件权限按 Go 的 `perm | 0700` / `perm | 0600` 创建 ✅
 - **重名不覆盖**：已有 `a.txt` → 落盘 `a.txt.0`，原文件保留 ✅ —— 与 Go `getNewName`（`comm.go:437-453`，`%s.%d`、255 字节上限、最多 1000 次）逐条一致
 - **零字节文件**：`SIZE:0` → 不发 DATA 直接 MD5 ✅
 - **MD5 逐文件校验**，不匹配报 `Check MD5 failed` ✅

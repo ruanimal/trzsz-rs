@@ -15,11 +15,14 @@ struct RecordingProgress {
     steps: Vec<i64>,
     done: usize,
     sizes: Vec<i64>,
+    names: Vec<String>,
 }
 
 impl ProgressCallback for RecordingProgress {
     fn on_num(&mut self, _num: i64) {}
-    fn on_name(&mut self, _name: &str) {}
+    fn on_name(&mut self, name: &str) {
+        self.names.push(name.to_string());
+    }
     fn on_size(&mut self, size: i64) {
         self.sizes.push(size);
     }
@@ -135,6 +138,49 @@ fn send_and_receive_report_progress_for_each_data_chunk() {
     assert_eq!(
         std::fs::read(destination.path().join("received.bin")).unwrap(),
         data
+    );
+}
+
+#[test]
+fn receive_progress_uses_source_name_after_local_directory_rename() {
+    let destination = tempfile::tempdir().unwrap();
+    std::fs::create_dir(destination.path().join("bundle")).unwrap();
+    let source = SourceFile {
+        path_id: 0,
+        abs_path: PathBuf::new(),
+        rel_path: vec![
+            "bundle".to_string(),
+            "nested".to_string(),
+            "source.txt".to_string(),
+        ],
+        is_dir: false,
+        archive: false,
+        sub_files: Vec::new(),
+        size: 0,
+        perm: None,
+    };
+    let protocol = format!(
+        "#NUM:1\n#NAME:{}\n#SIZE:0\n#MD5:{}\n",
+        escape::encode_string(&serde_json::to_string(&source).unwrap()),
+        escape::encode_bytes(&Md5::digest([]))
+    );
+    let mut transfer = TrzszTransfer::new(Box::new(io::sink()));
+    transfer.transfer_config.directory = true;
+    transfer.add_received_data(protocol.as_bytes(), false);
+    let mut progress = RecordingProgress::default();
+    let mut callback: Option<&mut dyn ProgressCallback> = Some(&mut progress);
+
+    let names = transfer
+        .recv_files(destination.path(), &mut callback)
+        .unwrap();
+
+    assert_eq!(names, vec!["bundle.0"]);
+    assert_eq!(progress.names, vec!["source.txt"]);
+    assert!(
+        destination
+            .path()
+            .join("bundle.0/nested/source.txt")
+            .exists()
     );
 }
 

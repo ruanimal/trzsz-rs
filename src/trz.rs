@@ -97,11 +97,13 @@ pub fn trz_main(args: &TrzArgs) -> i32 {
         }
     };
 
-    // Check path writable
     if let Err(e) = check_path_writable(&path) {
         eprintln!("{}", e.message);
         return -2;
     }
+    let mut resolved_args = args.clone();
+    resolved_args.path = path;
+    let args = &resolved_args;
 
     // Check tmux
     let (tmux_mode, _real_stdout, tmux_pane_width) = match comm::check_tmux() {

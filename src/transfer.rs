@@ -418,10 +418,8 @@ impl TrzszTransfer {
                 Err(error) => return Err(error),
             };
             let idx = line.iter().position(|&b| b == b':').filter(|&idx| idx >= 1);
-            let idx = idx.ok_or_else(|| TrzszError {
-                message: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &line),
-                err_type: "colon".to_string(),
-                trace: true,
+            let idx = idx.ok_or_else(|| {
+                crate::comm::new_trzsz_error(&escape::encode_bytes(&line), "colon", true)
             })?;
             let typ = String::from_utf8_lossy(&line[1..idx]).into_owned();
             let buf = String::from_utf8_lossy(&line[idx + 1..]).into_owned();
@@ -430,11 +428,7 @@ impl TrzszTransfer {
                 continue;
             }
             if typ != expect_type {
-                return Err(TrzszError {
-                    message: buf,
-                    err_type: typ,
-                    trace: true,
-                });
+                return Err(crate::comm::new_trzsz_error(&buf, &typ, true));
             }
             return Ok(buf);
         }
@@ -474,10 +468,8 @@ impl TrzszTransfer {
                 Err(error) => return Err(error),
             };
             let idx = line.iter().position(|&b| b == b':').filter(|&idx| idx >= 1);
-            let idx = idx.ok_or_else(|| TrzszError {
-                message: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &line),
-                err_type: "colon".to_string(),
-                trace: true,
+            let idx = idx.ok_or_else(|| {
+                crate::comm::new_trzsz_error(&escape::encode_bytes(&line), "colon", true)
             })?;
             let typ = String::from_utf8_lossy(&line[1..idx]).into_owned();
             let payload = String::from_utf8_lossy(&line[idx + 1..]).into_owned();
@@ -486,11 +478,7 @@ impl TrzszTransfer {
                 continue;
             }
             if typ != expect_type {
-                return Err(TrzszError {
-                    message: payload,
-                    err_type: typ,
-                    trace: true,
-                });
+                return Err(crate::comm::new_trzsz_error(&payload, &typ, true));
             }
             return Ok(payload);
         }
@@ -1128,18 +1116,28 @@ impl TrzszTransfer {
         &mut self,
         path: &Path,
     ) -> Result<(Option<Box<dyn FileWriter>>, String), TrzszError> {
+        let (file, local_name, _) = self.recv_file_name_with_source_name(path)?;
+        Ok((file, local_name))
+    }
+
+    fn recv_file_name_with_source_name(
+        &mut self,
+        path: &Path,
+    ) -> Result<(Option<Box<dyn FileWriter>>, String, String), TrzszError> {
         let file_name = self.recv_string("NAME", false, self.get_new_timeout())?;
-        let (mut file, local_name) = if self.transfer_config.directory {
+        let (mut file, local_name, source_name) = if self.transfer_config.directory {
             let src_file: SourceFile =
                 serde_json::from_str(&file_name).map_err(|e| TrzszError {
                     message: e.to_string(),
                     err_type: String::new(),
                     trace: false,
                 })?;
+            let source_name = src_file.get_file_name().to_string();
             let (f, ln) = self.create_dir_or_file(path, &src_file, true)?;
-            (f, ln)
+            (f, ln, source_name)
         } else {
-            self.create_file(path, &file_name)?
+            let (f, ln) = self.create_file(path, &file_name)?;
+            (f, ln, file_name)
         };
         if let Err(error) = self.send_string("SUCC", &local_name) {
             if let Some(file) = file.as_mut() {
@@ -1147,20 +1145,21 @@ impl TrzszTransfer {
             }
             return Err(error);
         }
-        Ok((file, local_name))
+        Ok((file, local_name, source_name))
     }
 
     fn recv_file_name_v3(
         &mut self,
         path: &Path,
         progress: &mut Option<&mut dyn ProgressCallback>,
-    ) -> Result<(Option<Box<dyn FileWriter>>, String), TrzszError> {
+    ) -> Result<(Option<Box<dyn FileWriter>>, String, String), TrzszError> {
         let payload = self.recv_string("NAME", false, self.get_new_timeout())?;
         let source: SourceFile = serde_json::from_str(&payload)
             .map_err(|e| crate::comm::simple_trzsz_error("Invalid source file", e))?;
         if source.size < 0 {
             return Err(crate::comm::simple_error("Invalid source file size"));
         }
+        let source_name = source.get_file_name().to_string();
         let (mut file, local_name) = self.create_dir_or_file(path, &source, false)?;
         let target_size =
             match file.as_ref() {
@@ -1192,7 +1191,7 @@ impl TrzszTransfer {
                 }
             }
         }
-        Ok((file, local_name))
+        Ok((file, local_name, source_name))
     }
 
     pub fn recv_file_size(&mut self) -> Result<i64, TrzszError> {
@@ -1277,13 +1276,14 @@ impl TrzszTransfer {
         }
         let mut local_names = Vec::new();
         for _ in 0..num {
-            let (file_opt, local_name) = if self.transfer_config.protocol >= K_PROTOCOL_VERSION3 {
-                self.recv_file_name_v3(path, progress)?
-            } else {
-                self.recv_file_name(path)?
-            };
+            let (file_opt, local_name, source_name) =
+                if self.transfer_config.protocol >= K_PROTOCOL_VERSION3 {
+                    self.recv_file_name_v3(path, progress)?
+                } else {
+                    self.recv_file_name_with_source_name(path)?
+                };
             if let Some(p) = progress.as_mut() {
-                p.on_name(&local_name);
+                p.on_name(&source_name);
             }
             if !local_names.contains(&local_name) {
                 local_names.push(local_name.clone());
@@ -1317,11 +1317,7 @@ impl TrzszTransfer {
             get_new_name(path, name)?
         };
         let full_path = path.join(&local_name);
-        let file = fs::File::create(&full_path).map_err(|e| TrzszError {
-            message: format!("Create file [{}] failed: {}", full_path.display(), e),
-            err_type: String::new(),
-            trace: false,
-        })?;
+        let file = fs::File::create(&full_path).map_err(|e| file_creation_error(&full_path, e))?;
         self.add_created_files(full_path.to_str().unwrap_or(""));
         Ok((Some(Box::new(SimpleFileWriter { file })), local_name))
     }
@@ -1399,11 +1395,7 @@ impl TrzszTransfer {
         };
 
         let file = create_file_with_mode(&full_path, src_file.perm.unwrap_or(0) | 0o600, truncate)
-            .map_err(|e| TrzszError {
-                message: format!("Create file [{}] failed: {}", full_path.display(), e),
-                err_type: String::new(),
-                trace: false,
-            })?;
+            .map_err(|e| file_creation_error(&full_path, e))?;
         self.add_created_files(full_path.to_str().unwrap_or(""));
         Ok((Some(Box::new(SimpleFileWriter { file })), local_name))
     }
@@ -1417,6 +1409,7 @@ impl TrzszTransfer {
         );
     }
 }
+
 fn archive_source_files(source_files: &[SourceFile]) -> Vec<SourceFile> {
     let mut archived = Vec::<SourceFile>::new();
     let mut positions = HashMap::<i32, usize>::new();
@@ -1440,6 +1433,22 @@ fn prepare_source_files(
         archive_source_files(source_files)
     } else {
         source_files.to_vec()
+    }
+}
+
+fn file_creation_error(path: &Path, error: io::Error) -> TrzszError {
+    let message = match error.kind() {
+        io::ErrorKind::PermissionDenied => {
+            format!("No permission to write: {}", path.display())
+        }
+        io::ErrorKind::IsADirectory => format!("Is a directory: {}", path.display()),
+        io::ErrorKind::NotADirectory => format!("Not a directory: {}", path.display()),
+        _ => format!("Create file [{}] failed: {}", path.display(), error),
+    };
+    TrzszError {
+        message,
+        err_type: String::new(),
+        trace: false,
     }
 }
 
@@ -1531,6 +1540,36 @@ mod tests {
         assert_eq!(config.timeout, 20);
         assert_eq!(config.newline, "\n");
         assert_eq!(config.bufsize, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn file_creation_errors_match_go_categories() {
+        let path = Path::new("target");
+        for (kind, expected) in [
+            (
+                io::ErrorKind::PermissionDenied,
+                "No permission to write: target",
+            ),
+            (io::ErrorKind::IsADirectory, "Is a directory: target"),
+            (io::ErrorKind::NotADirectory, "Not a directory: target"),
+        ] {
+            let error = file_creation_error(path, io::Error::from(kind));
+            assert_eq!(error.message, expected);
+        }
+    }
+
+    #[test]
+    fn recv_check_limited_decodes_go_remote_error_payload() {
+        let message = "limited remote error";
+        let wire = format!("#FAIL:{}\n", escape::encode_string(message));
+        let mut transfer = TrzszTransfer::new(Box::new(std::io::sink()));
+        transfer.add_received_data(wire.as_bytes(), false);
+
+        let error = transfer
+            .recv_check_limited("ACT", false, None, 128)
+            .unwrap_err();
+        assert_eq!(error.err_type, "FAIL");
+        assert_eq!(error.message, message);
     }
 
     #[test]

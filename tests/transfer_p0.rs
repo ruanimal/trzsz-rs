@@ -146,12 +146,54 @@ fn empty_data_before_negotiated_size_returns_error_without_spinning() {
 }
 
 #[test]
-fn malformed_colon_lines_are_errors_not_panics() {
-    for line in [b":oops\n".as_slice(), b"#\n", b"#:\n", b"\xffoops\n"] {
+fn malformed_colon_lines_use_go_error_encoding_and_never_panic() {
+    for line in [b":oops\n".as_slice(), b"#\n", b"\xffoops\n"] {
         let mut transfer = TrzszTransfer::new(Box::new(io::sink()));
         transfer.add_received_data(line, false);
-        assert!(transfer.recv_check("ACT", true, None).is_err());
+
+        let error = transfer.recv_check("ACT", true, None).unwrap_err();
+        let raw = &line[..line.len() - 1];
+        assert_eq!(error.err_type, "colon");
+        assert_eq!(
+            error.message,
+            format!("[TrzszError] colon: {}", escape::encode_bytes(raw))
+        );
+        assert!(error.trace);
     }
+}
+
+#[test]
+fn empty_message_type_matches_go_error_behavior() {
+    let mut transfer = TrzszTransfer::new(Box::new(io::sink()));
+    transfer.add_received_data(b"#:\n", false);
+
+    let error = transfer.recv_check("ACT", true, None).unwrap_err();
+    assert!(error.err_type.is_empty());
+    assert!(error.message.is_empty());
+}
+
+#[test]
+fn remote_fail_fail_and_exit_payloads_decode_like_go() {
+    for typ in ["fail", "FAIL", "EXIT"] {
+        let message = format!("remote {typ} message");
+        let wire = format!("#{typ}:{}\n", escape::encode_string(&message));
+        let mut transfer = TrzszTransfer::new(Box::new(io::sink()));
+        transfer.add_received_data(wire.as_bytes(), false);
+
+        let error = transfer.recv_check("ACT", false, None).unwrap_err();
+        assert_eq!(error.err_type, typ);
+        assert_eq!(error.message, message);
+    }
+}
+
+#[test]
+fn malformed_remote_error_payload_is_preserved() {
+    let mut transfer = TrzszTransfer::new(Box::new(io::sink()));
+    transfer.add_received_data(b"#FAIL:not-base64\n", false);
+
+    let error = transfer.recv_check("ACT", false, None).unwrap_err();
+    assert_eq!(error.err_type, "FAIL");
+    assert_eq!(error.message, "not-base64");
 }
 
 #[test]

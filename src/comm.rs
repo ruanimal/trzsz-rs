@@ -221,9 +221,15 @@ pub fn check_path_writable(path: &Path) -> Result<(), TrzszError> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        if !metadata.permissions().mode() & 0o200 != 0 {
-            return Err(simple_trzsz_error("No permission to write", path.display()));
+        use std::os::unix::ffi::OsStrExt;
+        let path_cstr = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|e| simple_trzsz_error("Check write permission failed", e))?;
+        if unsafe { libc::access(path_cstr.as_ptr(), libc::W_OK) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                return Err(simple_trzsz_error("No permission to write", path.display()));
+            }
+            return Err(simple_trzsz_error("Check write permission failed", error));
         }
     }
     Ok(())
@@ -497,9 +503,6 @@ pub fn hide_cursor(writer: &mut impl Write) {
 // ─── Format saved files ────────────────────────────────────────────────────
 
 pub fn format_saved_files(names: &[String], path: &Path) -> String {
-    if names.is_empty() {
-        return "No file saved".to_string();
-    }
     let count = names.len();
     let plural = if count > 1 {
         "files/directories"
@@ -847,7 +850,10 @@ mod tests {
     #[test]
     fn test_format_saved_files() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(format_saved_files(&[], dir.path()), "No file saved");
+        assert_eq!(
+            format_saved_files(&[], dir.path()),
+            format!("Saved 0 file/directory to {}", dir.path().display())
+        );
         assert_eq!(
             format_saved_files(&["foo.txt".to_string()], dir.path()),
             format!(
@@ -861,6 +867,41 @@ mod tests {
                 "Saved 2 files/directories to {}\r\n- a.txt\r\n- b.txt",
                 dir.path().display()
             )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_path_writable_uses_process_write_access() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let path_cstr = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
+        let process_can_write = unsafe { libc::access(path_cstr.as_ptr(), libc::W_OK) } == 0;
+
+        let result = check_path_writable(dir.path());
+        if process_can_write {
+            assert!(result.is_ok());
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .message
+                    .starts_with("No permission to write:")
+            );
+        }
+    }
+
+    #[test]
+    fn check_path_writable_rejects_non_directory() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        assert!(
+            check_path_writable(file.path())
+                .unwrap_err()
+                .message
+                .starts_with("Not a directory:")
         );
     }
 }

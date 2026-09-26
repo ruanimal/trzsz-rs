@@ -181,15 +181,13 @@ impl TrzszBuffer {
                 }
                 self.next_idx += idx + 1;
                 let line = &buf[..idx];
-                if may_has_junk && !self.read_buf.is_empty() && self.read_buf.last() == Some(&b'\r')
-                {
-                    self.read_buf.truncate(self.read_buf.len() - 1);
-                    self.read_buf.extend_from_slice(line);
-                    continue;
-                }
                 self.read_buf.extend_from_slice(line);
                 if self.read_buf.contains(&0x03) {
                     return Err(err_interrupted());
+                }
+                if may_has_junk && self.read_buf.last() == Some(&b'\r') {
+                    self.read_buf.pop();
+                    continue;
                 }
                 let mut line = self.read_buf.clone();
                 if may_has_junk {
@@ -436,5 +434,27 @@ mod tests {
         assert_eq!(buf.read_line(false, None).unwrap(), b"#DATA:10");
         assert_eq!(buf.read_binary(10, None).unwrap(), b"abcdefghij");
         assert_eq!(buf.read_line(false, None).unwrap(), b"#NEXT:1");
+    }
+    #[test]
+    fn read_line_discards_crlf_protocol_line_in_same_chunk() {
+        let mut buf = TrzszBuffer::new();
+        buf.add_buffer(b"#ACT:discarded\r\n#ACT:ready\n");
+
+        assert_eq!(
+            buf.read_line_for(Some("ACT"), true, None).unwrap(),
+            b"#ACT:ready"
+        );
+    }
+
+    #[test]
+    fn read_line_discards_crlf_protocol_line_across_chunks() {
+        let mut buf = TrzszBuffer::new();
+        buf.add_buffer(b"#ACT:discarded\r");
+        buf.add_buffer(b"\n#ACT:ready\n");
+
+        assert_eq!(
+            buf.read_line_for(Some("ACT"), true, None).unwrap(),
+            b"#ACT:ready"
+        );
     }
 }
