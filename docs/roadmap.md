@@ -5,7 +5,7 @@
 - `docs/transfer-gap-vs-go.md` —— 文件传输链路差距分析（服务端 `trz`/`tsz`，含实测结论）
 - `docs/library-porting-checklist.md` —— Go 库 API → Rust 移植清单（客户端 `TrzszFilter`/relay 等）
 
-**当前进度**：传输 P0/P1 与 V2–V4 协议已完成；库侧注入式 `TrzszFilter` 核心 Phase 0–3 已实现并通过本地 Go CLI 双向/目录互通。Relay 与 Phase 5 可选特性仍未实现，详见 [`docs/library-porting-checklist.md`](library-porting-checklist.md)。
+**当前进度**：传输 P0/P1 与 V2–V4 协议已完成；库侧 Filter Phase 0–3、Relay API（Phase 4）与可选 Filter 能力（Phase 5）均已实现，并通过本地 Go 与模拟跳板回归。自动 SSH/PTY/CLI 生命周期、`trzsz -r` 命令接线、库级后台传输与原生 GUI 仍属边界，详见 [`docs/library-porting-checklist.md`](library-porting-checklist.md)。
 
 ---
 
@@ -63,26 +63,27 @@ filter 按 CFG quiet 创建进度条，逐 chunk 更新宿主 progress callback�
 
 已提供状态/重绘 callback、取消/删除、终端列更新、默认路径与可注入路径选择器。blocking reader 可注册 shutdown handler。宿主负责接入 resize signal；本次不提供原生 GUI picker 或 demo host。
 
-### 后续步骤 · 明确排除
+### 已交付的库外围能力 · Phase 4/5
 
-Relay（Phase 4）、drag/ZMODEM/OSC52/trace/tmux control mode（Phase 5）和自动 SSH/PTY/CLI 包装仍未实现；它们不属于本次 `TrzszFilter` 核心闭环。Rust transfer 的 V1–V4 协议早已支持，本次不改线缆格式。
+新增 `TrzszRelay` API（ACT/CFG、双向中继、可选 tunnel connector、close/callback），并实现 Filter drag、ZMODEM、OSC52 host callback、trace、tmux control mode 与 Windows console hook。测试见 `src/relay.rs` 单测、`tests/relay_interop.rs` 和 `src/filter/features/`。
 
-### 第 6 步 · 可并行分支（按需排期）
+### 第 6 步 · 保留的并行缺口
 
-- **库 Phase 4**：relay（`trzsz -r` 跳板）
-- **库 Phase 5 / 传输外围**：drag、zmodem、OSC52、trace log、tmuxcc、Windows VT
-- **传输 P2 = 库 Phase 6**：协议 V2 流水线 + zstd（让 `-c` 生效）→ V3 断点续传 → V4 archive → 隧道/fork
+- `TrzszRelay` 与 Filter API 已交付；自动 `trzsz -r` 命令/PTY 生命周期不在本目标范围。
+- Filter 可选功能已交付；原生 GUI picker 与操作系统剪贴板 UI 由宿主提供，Windows runtime 尚未在 Windows 主机验证。
+- 协议 V2 流水线 + zstd → V3 HASH → V4 archive、隧道与 Unix fork 已实现；库级 `TrzszTransfer::background()` 仍是桩。
 
 ---
 
-## 三、当前明确未纳入的扩展
+## 三、当前边界
 
 | 范围 | 状态 |
 |---|---|
-| Relay / `trzsz -r` 跳板 | 未实现，本次 filter 只处理注入的四个 I/O 端点 |
-| drag、ZMODEM、OSC52、trace、tmux control mode、原生 GUI picker | 可选特性，未实现 |
-| 自动 SSH/PTY/CLI 生命周期与 resize signal 注册 | 由宿主负责；filter 提供 `run`/`close`、shutdown handler 和 terminal-columns API |
-| transfer protocol V2–V4 | 既有 Rust transfer 层已实现；本次不改线缆协议 |
+| Relay API / `trzsz -r` | library `TrzszRelay` 已实现并有 Go 跳板回归；CLI 分支未接线 |
+| Filter Phase 5 | drag、ZMODEM、OSC52 callback、trace、tmuxcc、Windows console hook 已实现；GUI/系统剪贴板 UI 由宿主负责 |
+| 自动 SSH/PTY/CLI 生命周期与 resize signal 注册 | 由宿主负责；Filter/Relay 提供 `run`/`close`、shutdown handler 和相关 API |
+| 库级后台传输 | `TrzszTransfer::background()` 仍是桩，未在本目标扩展 |
+| transfer protocol V2–V4 | 既有 Rust transfer 层已实现；本目标不改线缆格式 |
 
 ---
 
@@ -94,10 +95,10 @@ Relay（Phase 4）、drag/ZMODEM/OSC52/trace/tmux control mode（Phase 5）和�
 | **M1 核心 filter 可用** | ✅ | `tests/filter_interop.rs` 覆盖 S/R/D、本地 Go 互通、目录与取消 |
 | **M2 核心体验** | ✅ | progress callback/bar、错误/EOF/close 清理与 terminal columns API |
 | **M3 宿主核心 API** | ✅ | paths/selectors、上传入口、状态/重绘回调和 stop API；未新增 demo host |
-| **M4 Relay** | ⏭ | 不属于已批准的 TrzszFilter 核心目标 |
-| **M5 可选特性** | ⏭ | 按需排期 |
-| **M6 协议扩展** | ✅（既有） | V2–V4 已存在；本次不触碰协议能力 |
+| **M4 Relay** | ✅（library API） | `TrzszRelay` 控制流、tunnel、回调/关闭与 Go 跳板上传回归；CLI `-r` 未接线 |
+| **M5 可选特性** | ✅（Filter API） | drag/ZMODEM/OSC52/trace/tmuxcc/Windows console hook 均有本地测试 |
+| **M6 协议扩展** | ✅（协议/CLI）；⚠️ library background | V2–V4、隧道与 Unix fork 已实现；`TrzszTransfer::background()` 仍是桩 |
 
-**后续工作**：如需对齐 Go 的 Relay、可选 UI 功能或 wrapper 集成，应作为独立任务排期。
+**后续工作**：CLI `-r` 接线、自动 SSH/PTY/CLI 生命周期、library background、原生 GUI/系统剪贴板 UI 及 Windows runtime 验证应独立排期。
 
 **关键路径**：`第1步 → Phase 0 → Phase 1.1-1.6 → Phase 2.1 → Phase 3.3`。

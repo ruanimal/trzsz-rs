@@ -6,7 +6,7 @@
 
 - **Roadmap 第 1 步 / 传输 P0：已完成**（实现见提交 `06ab606`）：修复 Latin-1 转义、收发数据零进展、畸形协议行、`-r`、binary 降级及 `tmux_output_junk`。
 - **剩余传输 P1：已完成**：接收文件/目录按 Go 的 `perm | 0600` / `perm | 0700` 创建；停止删除兼容普通文件和目录；发送/接收句柄在成功、失败路径均 close；逐 DATA chunk 调用进度回调，`trz`/`tsz` 接入 stderr 进度条；Ctrl+C 通过共享 stop 状态唤醒 buffer 等待。
-- **V3+ 暂停/确认菜单与客户端 filter 核心已实现**：`trz`/`tsz` CLI 首次 Ctrl+C 暂停、再次弹出停止菜单；Rust `TrzszFilter` 提供显式 `run()`，实现双向 I/O pump、S/R/D 传输、host path picker、主动/一次性上传、状态/重绘/progress callback 及 close/error 收尾。filter 使用独立 client input 流分流按键；完整 Go 可选特性与 CLI/PTY 包装仍不在此范围。
+- **V3+ 暂停/确认菜单与库侧 Filter 已实现**：`trz`/`tsz` CLI 支持暂停/停止；Rust `TrzszFilter` 提供注入式 `run()`、S/R/D、host selectors、主动/一次性上传及 Phase 5 drag、ZMODEM、OSC52 callback、trace、tmux control mode；公开 `TrzszRelay` API 支持 ACT/CFG、双向中继和可选 tunnel。Go 互通与模拟跳板测试见 `tests/filter_interop.rs`、`tests/relay_interop.rs`。自动 CLI/PTY lifecycle 与 `trzsz -r` 接线不在库移植目标范围。
 - V2 流水线、zstd 流编码/解码及 protocol 1 回退已实现；V2 每文件使用有界 DATA 窗口（最多 5 帧在途），文本流使用 Base64，binary 流使用 escape，文件结束后继续执行原 MD5 校验。V3+ 支持 Go 兼容 `#DATA:=` 暂停心跳；V1/V2 不启用暂停。Rust 最高声明 protocol 4。
 - **V3 HASH 断点续传已实现**：按 10 MiB 累积 MD5 checkpoint 协商，匹配前缀后从末端继续；摘要不匹配时保留最后一个匹配 checkpoint 并重传其后内容。Rust protocol 3 保留 HASH 前的整数 `SIZE` 行；Go V4 的 HASH 使用 NAME 中的源尺寸、不交换此整数行，Rust V4 已对齐。
 - **V4 目录归档已实现**：同一 `path_id` 的目录子项在非覆盖模式下聚合为单个归档 DATA 流；覆盖模式和 protocol 1–3 保持 Go 的非归档行为。
@@ -15,7 +15,7 @@
 - **协议边界说明**：Go protocol 2（`Protocol < 3`）固定 `compress = !binary`，不交换 `COMP`，也不应用 CFG `compress`；V3 的 `yes/no` 由 CFG 选择，`auto` 在 size <512 时不压缩、512 B ≤ size <128 KiB 固定压缩，size ≥128 KiB 采样后交换 `#COMP:true/false`。Rust V3 对 Go peer 遵循该规则；Go protocol 2 的 `-c no` 仍无法由 Rust 端覆盖。
 - **第三节差异已收敛**：补齐 colon/远端错误载荷、junk 模式 CRLF、当前进程目录写权限、创建 errno 文案、源文件进度名、零文件/绝对路径完成提示；回归覆盖见 `src/buffer.rs`、`src/comm.rs`、`src/transfer.rs`、`tests/transfer_p0.rs` 与 `tests/transfer_p1.rs`。真实 tmux junk 场景仍待验证。
 **范围**：只看 `trz`/`tsz` 与对端之间的文件传输协议与实现，即 `src/transfer.rs`、`src/v2.rs`、`src/buffer.rs`、`src/escape.rs`、`src/comm.rs`（路径/校验部分）、`src/progress.rs`、`src/trz.rs`、`src/tsz.rs` 的传输流程。
-**明确排除**：`trzsz` 包装器（ssh/pty/数据泵）、relay、拖拽上传、zmodem、OSC52、文件选择对话框等非传输项。
+**报告范围排除**：本文不分析 `trzsz` SSH/PTY wrapper、Relay 与 drag/ZMODEM/OSC52/trace/tmux control mode 的具体实现；这些库侧能力的当前状态见 [`docs/library-porting-checklist.md`](library-porting-checklist.md)。
 **参考实现**：`trzsz-go` @ `4432ed0`（子模块已检出）。
 **方法**：源码逐函数比对 + 实测 —— 用 Python 按 Go 的线缆格式（`#TYPE:` + base64(zlib(...))）直接驱动 `target/debug/trz` 与 `tsz`，跑 ACT/CFG/NUM/NAME/SIZE/DATA/MD5/EXIT 全流程。
 
@@ -168,7 +168,7 @@ Go `handleServerSignal`：SIGINT/SIGTERM → `stopTransferringFiles(false)`（`c
 7. ✅ **P2 / V2 流水线完成** — 流式 zstd、五帧有界 ACK 窗口和 protocol 1 回退；V2 Go peer 仍固定 `!binary`，不收发 COMP。
 8. ✅ **P2 / V3 HASH + COMP 完成** — 实现 10 MiB HASH checkpoint 续传和 Go V3+ `yes/no/auto` COMP 规则；Rust protocol 3 的整数 `SIZE` 线格式及 Go V4 的 NAME-size 规则均有回归。
 9. ✅ **P2 / V4 目录归档完成** — V4 非覆盖模式按 `path_id` 聚合目录条目并以 Go 兼容归档 DATA 流还原；真实 Go 双向互通及 Rust V3 回退测试通过。
-10. ✅ **P2 完成** — 动态 tunnel 端口、Go hello 握手、协议 writer/input 切换、Unix fork/setsid、V3+ pause/resume 心跳及暂停后的 CLI 停止/删除确认菜单；Go filter tunnel 双向实测通过。Rust `TrzszFilter` 核心双向传输与 lifecycle 已实现并由 `tests/filter_interop.rs` 覆盖；Relay、完整 Go 可选 filter 特性及非 Unix fork 仍未实现。
+- **P2 完成** — 动态 tunnel 端口、Go hello 握手、协议 writer/input 切换、Unix fork/setsid、V3+ pause/resume heartbeat 与暂停停止菜单；Rust V2–V4 与 Filter Phase 0–3/Phase 5、Relay API 均有实现及本地回归。库级 `TrzszTransfer::background()` 仍是桩，非 Unix fork、自动 `trzsz -r` wrapper 接线、原生 GUI/系统剪贴板 UI 与 Windows runtime 验证仍未包含。
 
 ---
 

@@ -200,6 +200,7 @@ pub struct TrzszTransfer {
     pub peer_lang: String,
     pub created_files: Vec<String>,
     pub tunnel_connected: bool,
+    pub tmux_integration: bool,
     tunnel_tx: mpsc::SyncSender<std::net::TcpStream>,
     tunnel_rx: mpsc::Receiver<std::net::TcpStream>,
     pub bg_chan: mpsc::SyncSender<()>,
@@ -238,10 +239,16 @@ impl TrzszTransfer {
             created_files: Vec::new(),
             peer_lang: String::new(),
             tunnel_connected: false,
+            tmux_integration: false,
             tunnel_tx,
             tunnel_rx,
             bg_chan: bg_tx,
         }
+    }
+
+    /// Enable tmux control-mode negotiation for a filter transfer.
+    pub fn set_tmux_integration(&mut self, enabled: bool) {
+        self.tmux_integration = enabled;
     }
 
     pub fn background(&self) -> mpsc::Receiver<()> {
@@ -649,8 +656,9 @@ impl TrzszTransfer {
             confirm,
             newline: "\n".to_string(),
             protocol,
-            support_binary: true,
+            support_binary: self.tunnel_connected || !self.tmux_integration,
             support_directory: true,
+            tmux_integration: self.tmux_integration,
             ..Default::default()
         };
 
@@ -1528,6 +1536,36 @@ fn with_closed_file_writer<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn tmux_control_mode_is_advertised_in_action_without_binary_support() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut transfer = TrzszTransfer::new(Box::new(CaptureWriter(bytes.clone())));
+        transfer.set_tmux_integration(true);
+        transfer.send_action(false, None, false).unwrap();
+
+        let bytes = bytes.lock().unwrap();
+        let payload = std::str::from_utf8(&bytes[b"#ACT:".len()..bytes.len() - 1]).unwrap();
+        let action: TransferAction =
+            serde_json::from_slice(&escape::decode_string(payload).unwrap()).unwrap();
+        assert!(action.tmux_integration);
+        assert!(!action.support_binary);
+    }
 
     #[test]
     fn test_transfer_action_default() {

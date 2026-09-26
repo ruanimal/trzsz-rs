@@ -3,7 +3,7 @@
 > 实施顺序与里程碑见 [`docs/roadmap.md`](roadmap.md)；服务端传输差距见 [`docs/transfer-gap-vs-go.md`](transfer-gap-vs-go.md)。
 
 **背景**：`trzsz-go` 不只是 CLI，还是被真实项目依赖的 Go 库（pkg.go.dev "Imported by" 3 个模块 / 6 个包：`trzsz/trzsz-ssh/tssh`、`abakum/{cssh,dssh,trzsz-ssh}/tssh`、`jixishi/SerialTerminalForWindowsTerminal`、`shoaibashk/nanocom`），核心价值是 `TrzszFilter` —— 让宿主终端程序在本地侧具备触发上传/下载的能力。
-`trzsz-rs` 结构上同样是 lib + bin；客户端 `TrzszFilter` 的 Phase 0–3 核心已实现，Go 的可选 filter 功能、Relay 与自动 CLI/PTY 包装仍不在本次范围。
+`trzsz-rs` 结构上同样是 lib + bin；注入式 Filter Phase 0–3、Relay API Phase 4 与 Filter 可选能力 Phase 5 已实现，V2–V4 协议层也已存在。自动 SSH/PTY/CLI（含 `trzsz -r`）接线、原生 GUI/系统剪贴板 UI 和库级后台传输不在本清单交付范围；`TrzszTransfer::background()` 仍是桩。
 
 **本文目的**：按依赖顺序列出从 Go 库 API 到 Rust 的移植清单，每项标注前置条件与验收标准。
 
@@ -115,31 +115,32 @@ Upload selector 接收“是否允许目录”和建议起始目录；download s
 
 **前置**：Phase 1（复用 detector/handshake 的消息读写）；隧道相关依赖 Phase 6.4。
 
-| # | 目标 | 对应 Go | 现状 |
-|---|---|---|---|
-| 4.1 | `NewTrzszRelay` + `run` | `relay.go:690` | ❌ `trzsz.rs:78-98` 的 `-r` 分支只是构造了一个普通 filter |
-| 4.2 | `handshake`（ACT/CFG 透传） | `relay.go:429-480` | ❌ |
-| 4.3 | `wrapInput`/`wrapOutput` 中继 | `relay.go:501-596` | ❌ |
-| 4.4 | tunnel relay（hello token 重写） | `relay.go:103-230, 598-688` | ❌ |
-| 4.5 | `SetTunnelConnector` / `SetTransferStateCallback` on relay | `relay.go:81,90` | ❌ |
-| 4.6 | `Close()` | `relay.go:99` | ❌ |
+| # | 目标 | 对应 Go | 状态 | 说明 |
+|---|---|---|---|---|
+| 4.1 | Relay 构造与 `run` | `relay.go:690` | ✅ | 新增并导出 `TrzszRelay::new/run`，单次阻塞运行；CLI `-r` 生命周期接线仍不在本目标范围 |
+| 4.2 | ACT/CFG 握手 | `relay.go:429-480` | ✅ | 编解码并转发 ACT/CFG，协商协议上限与 binary 能力；畸形输入以 FAIL 返回 |
+| 4.3 | 双向输入/输出中继 | `relay.go:501-596` | ✅ | 缓冲握手前字节，双向转发正文，EXIT/FAIL 结束状态并成对通知 callback |
+| 4.4 | tunnel relay（hello/token 重写） | `relay.go:103-230, 598-688` | ✅ | 动态 loopback listener、触发端口重写、两段 hello/token 校验与双向隧道转发；覆盖 loopback 回归 |
+| 4.5 | `SetTunnelConnector` / `SetTransferStateCallback` | `relay.go:81,90` | ✅ | Rust `set_tunnel_connector` 注入服务器连接，`set_transfer_state_callback` 通知起止状态 |
+| 4.6 | `Close()` | `relay.go:99` | ✅ | `close` 停止 listener，并通过 host shutdown handlers 唤醒阻塞 reader；有单测覆盖 |
 
-**验收**：`trzsz -r` 经跳板机完成一次传输（可用 Python 模拟跳板两侧）。
+**验收**：`tests/relay_interop.rs` 通过 Relay + Rust Filter 向仓库 Go `trz` 完成文件上传；`relay.rs` 单测覆盖 ACT/CFG、错误、普通中继、loopback hello 隧道与 close。自动 `trzsz -r` CLI/PTY 接线按本目标边界未包含。
+
 
 ---
 
-## Phase 5 — 可选特性（P2，开关已存在但全是死的）
+## Phase 5 — 可选特性（P2，Filter API 已实现）
 
 **前置**：Phase 1。
 
 | # | 开关 | 对应 Go | 现状 | 说明 |
 |---|---|---|---|---|
-| 5.1 | `-d/--dragfile` | `drag.go`(360) + `filter.go:572-626,649-673` | ⚠️ 选项存了（`trzsz.rs:104`）、conf 键读了，无检测逻辑 | 需要 shlex 拆分 + 平台路径（Windows/MSYS/Cygwin/cygpath） |
-| 5.2 | `-z/--zmodem` | `zmodem.go`(404) | ⚠️ `trzsz.rs:106` 死开关 | 需要 spawn `sz`/`rz` + 双向流 + 定时器 |
-| 5.3 | `-o/--osc52` | `filter.go:801-860` | ⚠️ `trzsz.rs:107` 死开关 | |
-| 5.4 | `-t/--tracelog` | `comm.go:817-877 traceLogger` | ⚠️ `trzsz.rs:105` 死开关 | 含 `<ENABLE_TRZSZ_TRACE_LOG>` 协议 |
-| 5.5 | tmux control mode 传输 | `tmuxcc.go`(431) | ❌ 仅 `progress.rs:232-248` 有 prefix 编码（但 `tmux_prefix` 恒为空） | 与服务端 `tmux_output_junk`/tty 输出一起做才完整 |
-| 5.6 | Windows VT/代码页 | `pty_windows.go`(280)、`setupVirtualTerminal` | ⚠️ `trzsz.rs:131-137` 空函数；`conpty` 依赖声明了未引用 | 库形态下宿主可能自己管，先给 hook |
+| 5.1 | `-d/--dragfile` | `drag.go`(360) + `filter.go:572-626,649-673` | ✅ | bounded fragmented input + shell-word parsing；POSIX/bracketed paste/Warp 及 Windows drive/MSYS/Cygwin/可选 `cygpath` 路径；回归见 `filter/features/drag.rs`，实际路径经 metadata 校验 |
+| 5.2 | `-z/--zmodem` | `zmodem.go`(404) | ✅ | 检测 init/finish，host selector 选路径，启动可配置 `sz`/`rz`，双向泵、OverAndOut、cancel 与 20 秒 inactivity timeout；假子进程回归见 `filter/features/zmodem.rs` |
+| 5.3 | `-o/--osc52` | `filter.go:801-860` | ✅ | 分片/限长 OSC52 parser 解码 Base64，通过 `set_clipboard_callback` 交给宿主；不内置平台剪贴板依赖 |
+| 5.4 | `-t/--tracelog` | `comm.go:817-877 traceLogger` | ✅ | `<ENABLE_TRZSZ_TRACE_LOG>` / `<DISABLE_TRZSZ_TRACE_LOG>` 跨 read 识别、临时日志、Go 兼容 `[type]base64(zlib(bytes))` 记录；有实际日志文件回归 |
+| 5.5 | tmux control mode 传输 | `tmuxcc.go`(431) | ✅ | pane/output 分片解码、octal 数据、`send -lt/-t` 与 ack、ACT `tmuxcc` 协商、tmux-prefixed progress；单测覆盖协议编码和 ack |
+| 5.6 | Windows VT/代码页 | `pty_windows.go:78-160` | ✅ API | 导出 `WindowsConsoleGuard` RAII hook，保存/恢复 mode 与 UTF-8 code pages，启用 VT input/output 和 `DISABLE_NEWLINE_AUTO_RETURN`；Windows 模块独立 cross-check 通过，macOS no-op/纯逻辑测试通过，Windows runtime 未运行 |
 
 ---
 
@@ -147,13 +148,13 @@ Upload selector 接收“是否允许目录”和建议起始目录；download s
 
 **前置**：无（与 Phase 1-5 无依赖关系，只影响传输性能/能力）。
 
-| # | 目标 | 对应 Go | 现状 |
-|---|---|---|---|
-| 6.1 | V2 流水线 + `COMP` 协商 + zstd | `pipeline.go`(1076) | ❌ `K_PROTOCOL_VERSION = 1`（`transfer.rs:55`）；**`-c/--compress` 是空开关** |
-| 6.2 | V3 前缀哈希断点续传 | `append.go`(375) | ❌ 无 `HASH` 处理 |
-| 6.3 | V4 archive 目录打包 | `archive.go`(249) | ❌ `sub_files()` 恒 `&[]`（`comm.rs:643`） |
-| 6.4 | 隧道 + fork 后台 | `comm.go:991-997`、`transfer.go:154-250,243` | ⚠️ `listen_for_tunnel` 无人调用、端口写死 0、`background()` 是桩（`transfer.rs:220-224`）、`-f` 必然失败 |
-| 6.5 | 暂停/恢复 | `pipeline.go:340-406` | ❌ |
+| # | 目标 | 对应 Go | 状态 | 说明 |
+|---|---|---|---|---|
+| 6.1 | V2 流水线 + `COMP` 协商 + zstd | `pipeline.go`(1076) | ✅ | 有界 V2 DATA 窗口、zstd 流编码/解码、COMP 协商和 protocol 1 回退已实现；Go V2 对端保持固定 `!binary` 行为 |
+| 6.2 | V3 前缀哈希断点续传 | `append.go`(375) | ✅ | 10 MiB HASH checkpoint 匹配/回退重传已实现；V3/V4 SIZE 差异与 Go 互通有回归覆盖 |
+| 6.3 | V4 archive 目录打包 | `archive.go`(249) | ✅ | V4 非覆盖目录按 `path_id` 聚合归档；Go 双向互通已验证 |
+| 6.4 | 隧道 + fork 后台 | `comm.go:991-997`、`transfer.go:154-250` | ⚠️ CLI 已实现；库级后台未完成 | `trz`/`tsz` 已使用动态 loopback 端口、hello 握手和 Unix fork/setsid；`TrzszTransfer::background()` 仍是桩（Rust 当前定义见 `transfer.rs:254`），本目标不扩展库级 fork/background |
+| 6.5 | 暂停/恢复 | `pipeline.go:340-406` | ✅ | V3+ `#DATA:=` heartbeat 与恢复已实现；CLI 首次 Ctrl+C 暂停、再次确认停止，filter 输入泵分流控制键；协议完整性有回归覆盖 |
 
 **顺序建议**：6.1 → 6.2 → 6.3 → 6.4 → 6.5。6.1 是 6.2/6.3/6.5 的地基（它们都建立在 V2 的流水线读写上）。
 
@@ -178,12 +179,12 @@ Upload selector 接收“是否允许目录”和建议起始目录；download s
 
 | 层级 | 状态 / 后续 |
 |---|---|
-| 单测 | 已覆盖 fragmented/malformed trigger、普通输入输出透传、close 和 I/O error；可继续对齐 Go detector 全量边界用例 |
-| 协议层 | `tests/filter_interop.rs` 本地 Go `tsz`/`trz` 覆盖 filter 下载、单文件/目录上传和 picker 取消 |
-| 真实互通 | 测试直接构建仓库 Go `cmd/tsz`、`cmd/trz`，不依赖固定 `/tmp/go-*` 二进制 |
-| 库级 | public API 通过 integration test 调用；未新增 demo terminal host |
+| 单测 | trigger、普通透传、close/error，以及 drag、OSC52、trace、ZMODEM、tmuxcc、Relay、Windows hook 的局部回归均可本地运行 |
+| 协议层 | `tests/filter_interop.rs` 覆盖 Go `tsz`/`trz` 双向/目录传输；`tests/relay_interop.rs` 覆盖 Relay 跳板上传 |
+| 真实互通 | 按需构建仓库 Go `cmd/tsz`、`cmd/trz`；Filter/Relay 与 Go V3/V4 互通不依赖固定 `/tmp/go-*` 二进制 |
+| 库级 | Filter、Relay、WindowsConsoleGuard public API 有 integration/unit test；未新增 demo terminal host |
 
-可选 OSC52/drag/zmodem/trace/tmuxcc 与 relay 不属于本次核心 filter 范围。
+可选功能为注入式 Filter API；OSC52 剪贴板由 host callback 提供，ZMODEM 依赖 host 安装的 `sz`/`rz`。
 
 ---
 
@@ -194,8 +195,8 @@ Upload selector 接收“是否允许目录”和建议起始目录；download s
 | **M1 核心库可用** | ✅ | S/R/D、分片 trigger、普通输出透传、Go `tsz`/`trz` 本地互通与目录上传均由 `tests/filter_interop.rs` 覆盖 |
 | **M2 核心体验** | ✅ | progress bar/observer、路径默认值、文件权限与资源收尾有回归覆盖 |
 | **M3 宿主核心 API** | ✅ | callback、取消、terminal columns、picker selector 和 upload API 已公开；未新增 demo host，resize signal 仍由宿主接线 |
-| **M4 Relay** | ⏭ | 明确不属于 `TrzszFilter` 核心范围 |
-| **M5 可选特性** | ⏭ | drag、ZMODEM、OSC52、trace、tmuxcc 与原生 GUI picker 未实现 |
-| **M6 协议扩展** | ✅（服务端已有） | Rust V2–V4 transfer 实现先前已存在，本次未扩展线缆协议 |
+| **M4 Relay** | ✅（library API） | `TrzszRelay` lifecycle/handshake/tunnel/callback/close；真实 Go `trz` 跳板上传回归；`trzsz -r` CLI branch 未接线 |
+| **M5 可选特性** | ✅（Filter API） | drag、ZMODEM、OSC52 callback、trace、tmuxcc、Windows console hook 均有本地回归；原生 GUI/系统剪贴板 UI 由宿主提供 |
+| **M6 协议扩展** | ✅（协议/CLI 已有） | V2–V4、tunnel 与 Unix `-f` 已实现；库级 `TrzszTransfer::background()` 仍为桩，本目标未扩展 |
 
-**后续边界**：可选 Phase 5、Relay、自动 signal/PTY/CLI 集成仍未实现，不影响注入式 `TrzszFilter` 核心 API 使用。
+**后续边界**：不包含自动 SSH/PTY/CLI 生命周期、`trzsz -r` 命令接线、原生 GUI picker、库级后台传输以及 Windows runtime 验证；这些不影响注入式 Filter/Relay public API 的使用。

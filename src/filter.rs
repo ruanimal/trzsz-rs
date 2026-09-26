@@ -28,8 +28,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+mod features;
 use crate::comm::{self, TrzszError, check_path_writable, check_paths_readable};
 use crate::progress::{ProgressCallback, TextProgressBar};
 use crate::stop_prompt::StopPromptController;
@@ -44,13 +45,13 @@ const MAX_TRIGGER_LINE: usize = 512;
 pub struct TrzszOptions {
     /// Current terminal width used by the progress bar.
     pub terminal_columns: i32,
-    /// Reserved for optional drag-and-drop support.
+    /// Detect shell-quoted POSIX absolute paths pasted into the terminal and upload them.
     pub detect_drag_file: bool,
-    /// Reserved for optional trace logging.
+    /// Detect trace control markers emitted by the remote shell.
     pub detect_trace_log: bool,
-    /// Reserved for optional ZMODEM support.
+    /// Bridge detected ZMODEM sessions to local `sz` / `rz` executables.
     pub enable_zmodem: bool,
-    /// Reserved for optional OSC52 support.
+    /// Decode OSC52 output and send its clipboard text to a configured host callback.
     pub enable_osc52: bool,
 }
 
@@ -118,6 +119,8 @@ pub struct TrzszFilter {
     state_callback: Mutex<Option<StateCallback>>,
     redraw_callback: Mutex<Option<RedrawCallback>>,
     progress_observer: Mutex<Option<ProgressObserver>>,
+    clipboard_callback: Mutex<Option<Arc<dyn Fn(String) + Send + Sync + 'static>>>,
+    zmodem_commands: Mutex<(std::ffi::OsString, std::ffi::OsString)>,
     client_input_shutdown: Mutex<Option<ShutdownCallback>>,
     server_output_shutdown: Mutex<Option<ShutdownCallback>>,
 }
@@ -172,6 +175,8 @@ enum PumpEvent {
     ServerEof,
     ServerError(io::Error),
     TransferDone,
+    ZmodemData(Vec<u8>),
+    ZmodemDone,
 }
 
 struct TriggerDetector {
@@ -251,10 +256,13 @@ fn parse_trigger(line: &[u8]) -> Option<TrzszTrigger> {
         return None;
     }
     let tunnel_port = match parts.get(3).copied().filter(|value| !value.is_empty()) {
-        Some(value) if value.bytes().all(|byte| byte.is_ascii_digit()) => {
+        Some(value) => {
+            let value = value.strip_suffix("#R").unwrap_or(value);
+            if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
             value.parse::<i32>().ok()?
         }
-        Some(_) => return None,
         None => 0,
     };
     let unique_id = unique_id.to_string();
@@ -333,6 +341,8 @@ impl TrzszFilter {
             download_selector: Mutex::new(None),
             pending_upload: Mutex::new(None),
             state_callback: Mutex::new(None),
+            clipboard_callback: Mutex::new(None),
+            zmodem_commands: Mutex::new(("sz".into(), "rz".into())),
             redraw_callback: Mutex::new(None),
             progress_observer: Mutex::new(None),
             client_input_shutdown: Mutex::new(None),
@@ -500,6 +510,27 @@ impl TrzszFilter {
         *self.progress_observer.lock().unwrap() = None;
     }
 
+    /// Configure the host clipboard sink used for decoded OSC52 text.
+    /// No platform clipboard is accessed by the filter itself.
+    pub fn set_clipboard_callback<F>(&self, callback: F)
+    where
+        F: Fn(String) + Send + Sync + 'static,
+    {
+        *self.clipboard_callback.lock().unwrap() = Some(Arc::new(callback));
+    }
+
+    pub fn clear_clipboard_callback(&self) {
+        *self.clipboard_callback.lock().unwrap() = None;
+    }
+
+    /// Override the local ZMODEM command paths (defaults to `sz` and `rz`).
+    pub fn set_zmodem_commands(&self, sz: impl AsRef<Path>, rz: impl AsRef<Path>) {
+        *self.zmodem_commands.lock().unwrap() = (
+            sz.as_ref().as_os_str().to_os_string(),
+            rz.as_ref().as_os_str().to_os_string(),
+        );
+    }
+
     /// Read upload/download defaults from `$HOME/.trzsz.conf` without replacing
     /// values already configured through the API.
     pub fn read_trzsz_config(&self) {
@@ -621,44 +652,193 @@ impl TrzszFilter {
         sender: SyncSender<PumpEvent>,
     ) -> io::Result<()> {
         let mut detector = TriggerDetector::new();
+        let mut osc52 = features::osc52::Osc52Parser::default();
+        let mut trace = features::trace::TraceLogger::default();
+        let mut drag = features::drag::DragInput::default();
+        let mut zmodem_detector = features::zmodem::ZmodemDetector::default();
+        let mut zmodem_server_finish_detector = features::zmodem::ZmodemFinishDetector::default();
+        let mut zmodem_client_finish_detector = features::zmodem::ZmodemFinishDetector::default();
+        let mut zmodem: Option<features::zmodem::ZmodemProcess> = None;
+        let mut zmodem_upload = false;
+        let mut zmodem_server_finished = false;
+        let mut zmodem_client_finished = false;
+        let mut zmodem_last_activity = None;
+        let mut zmodem_timed_out = false;
+        let mut zmodem_over_and_out_sent = false;
+        let mut tmux = features::tmuxcc::TmuxControlDecoder::default();
+        let mut tmux_input = features::tmuxcc::TmuxInputDecoder::default();
         let mut client_eof = false;
         let mut server_eof = false;
         let mut transfer_input: Option<SyncSender<Vec<u8>>> = None;
         loop {
             if self.closed.load(Ordering::SeqCst) {
+                if let Some(process) = zmodem.as_mut() {
+                    let _ = process.child.kill();
+                    let _ = process.child.wait();
+                }
                 return Ok(());
             }
             let event = match receiver.recv_timeout(Duration::from_millis(50)) {
                 Ok(event) => event,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if !zmodem_timed_out
+                        && zmodem_last_activity.is_some_and(|last| {
+                            features::zmodem::idle_timeout_elapsed(last, Instant::now())
+                        })
+                    {
+                        zmodem_timed_out = true;
+                        if let Some(process) = zmodem.as_mut() {
+                            process.stdin.take();
+                            let _ = process.child.kill();
+                        }
+                        let mut server = self.server_in.writer();
+                        let _ = server
+                            .write_all(features::zmodem::CANCEL_SEQUENCE)
+                            .and_then(|_| server.flush());
+                        let mut client = self.client_out.writer();
+                        let _ = client
+                            .write_all(b"\r\nZMODEM transfer timed out\r\n")
+                            .and_then(|_| client.flush());
+                    }
+                    if self.options.detect_drag_file
+                        && drag.is_pending()
+                        && drag.should_finish(Instant::now())
+                    {
+                        let (held, paths) = drag.finish();
+                        if paths
+                            .as_ref()
+                            .is_some_and(|paths| self.upload_files(paths).is_ok())
+                        {
+                            continue;
+                        }
+                        let mut writer = self.server_in.writer();
+                        writer.write_all(&held)?;
+                        writer.flush()?;
+                    }
+                    continue;
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             };
             match event {
                 PumpEvent::ClientData(bytes) => {
+                    if self.options.detect_trace_log {
+                        trace.log("stdin", &bytes);
+                    }
+                    if let Some(process) = zmodem.as_mut() {
+                        zmodem_last_activity = Some(Instant::now());
+                        if bytes.as_slice() == [0x03] {
+                            let mut writer = self.server_in.writer();
+                            let _ = writer
+                                .write_all(features::zmodem::CANCEL_SEQUENCE)
+                                .and_then(|_| writer.flush());
+                            process.stdin.take();
+                            let _ = process.child.kill();
+                            zmodem_timed_out = true;
+                        } else if let Some(stdin) = process.stdin.as_mut() {
+                            if stdin.write_all(&bytes).and_then(|_| stdin.flush()).is_err() {
+                                let _ = process.child.kill();
+                            }
+                        }
+                        continue;
+                    }
+                    if let Some(trigger) = self
+                        .current_trigger
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .filter(|trigger| !trigger.tmux_pane_id.is_empty())
+                    {
+                        for action in tmux_input.feed(&bytes, &trigger.tmux_pane_id) {
+                            match action {
+                                features::tmuxcc::TmuxClientInput::CurrentPane(keys) => {
+                                    if let Some(controller) =
+                                        self.active_controller.lock().unwrap().clone()
+                                    {
+                                        let mut output = self.client_out.writer();
+                                        for key in keys {
+                                            controller.handle_filter_input(key, &mut output);
+                                        }
+                                    }
+                                    let mut output = self.client_out.writer();
+                                    output.write_all(&features::tmuxcc::client_input_ack())?;
+                                    output.flush()?;
+                                }
+                                features::tmuxcc::TmuxClientInput::Forward(command) => {
+                                    let _ = tmux.ack.issue(false);
+                                    let mut framed = command;
+                                    framed.push(b'\r');
+                                    let mut writer = self.server_in.writer();
+                                    writer.write_all(&framed)?;
+                                    writer.flush()?;
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     let controller = self.active_controller.lock().unwrap().clone();
                     if let Some(controller) = controller {
                         let mut output = self.client_out.writer();
                         for key in bytes {
                             controller.handle_filter_input(key, &mut output);
                         }
-                    } else {
-                        let mut writer = self.server_in.writer();
-                        writer.write_all(&bytes)?;
-                        writer.flush()?;
+                        continue;
                     }
+                    if self.options.detect_drag_file {
+                        let now = Instant::now();
+                        if drag.is_pending() || drag.push(&bytes, now) {
+                            if drag.should_finish(now) {
+                                let (held, paths) = drag.finish();
+                                if paths
+                                    .as_ref()
+                                    .is_some_and(|paths| self.upload_files(paths).is_ok())
+                                {
+                                    continue;
+                                }
+                                let mut writer = self.server_in.writer();
+                                writer.write_all(&held)?;
+                                writer.flush()?;
+                            }
+                            continue;
+                        }
+                    }
+                    let mut writer = self.server_in.writer();
+                    writer.write_all(&bytes)?;
+                    writer.flush()?;
                 }
                 PumpEvent::ClientEof => {
                     client_eof = true;
+                    if let Some((held, paths)) = drag.is_pending().then(|| drag.finish()) {
+                        if paths
+                            .as_ref()
+                            .is_some_and(|paths| self.upload_files(paths).is_ok())
+                        {
+                            // The upload command is queued before the endpoint is closed.
+                        } else {
+                            let mut writer = self.server_in.writer();
+                            writer.write_all(&held)?;
+                            writer.flush()?;
+                        }
+                    }
+                    if let Some(process) = zmodem.as_mut() {
+                        let _ = process.child.kill();
+                    }
                     if let Some(controller) = self.active_controller.lock().unwrap().as_ref() {
                         controller.handle_filter_eof();
                         controller.stop(false);
+                    }
+                    if let Some(features::tmuxcc::TmuxClientInput::Forward(pending)) =
+                        tmux_input.finish()
+                    {
+                        let mut writer = self.server_in.writer();
+                        writer.write_all(&pending)?;
+                        writer.flush()?;
                     }
                     self.server_in.close();
                     let shutdown = self.server_output_shutdown.lock().unwrap().clone();
                     if let Some(shutdown) = shutdown {
                         shutdown();
                     }
-                    if server_eof && transfer_input.is_none() {
+                    if server_eof && transfer_input.is_none() && zmodem.is_none() {
                         return Ok(());
                     }
                 }
@@ -667,28 +847,220 @@ impl TrzszFilter {
                     if let Some(controller) = self.active_controller.lock().unwrap().as_ref() {
                         controller.stop(false);
                     }
-                    if transfer_input.is_none() {
+                    if let Some(process) = zmodem.as_mut() {
+                        let _ = process.child.kill();
+                    }
+                    if transfer_input.is_none() && zmodem.is_none() {
                         return Ok(());
                     }
                 }
                 PumpEvent::ClientError(error) => return Err(error),
-                PumpEvent::ServerData(bytes) => {
-                    let bytes = if let Some(input) = transfer_input.as_ref() {
-                        if self.transferring.load(Ordering::SeqCst) {
-                            match input.send(bytes) {
-                                Ok(()) => continue,
-                                Err(error) => {
-                                    transfer_input = None;
-                                    error.0
+                PumpEvent::ServerData(mut bytes) => {
+                    let tmux_input = tmux.should_parse(&bytes);
+                    let transfer_active = self.transferring.load(Ordering::SeqCst);
+                    if !tmux_input {
+                        if let Some(input) = transfer_input.as_ref() {
+                            if transfer_active {
+                                match input.send(bytes) {
+                                    Ok(()) => continue,
+                                    Err(error) => {
+                                        transfer_input = None;
+                                        bytes = error.0;
+                                    }
+                                }
+                            } else {
+                                transfer_input = None;
+                            }
+                        }
+                    }
+                    let tmux_transfer = tmux_input
+                        && transfer_active
+                        && self
+                            .current_trigger
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .is_some_and(|trigger| !trigger.tmux_pane_id.is_empty());
+                    if !tmux_transfer && self.options.detect_trace_log {
+                        trace.log("svrout", &bytes);
+                        if zmodem.is_none() {
+                            bytes = trace.process_server_output(&bytes);
+                        }
+                    }
+                    if !tmux_transfer && zmodem.is_none() && self.options.enable_osc52 {
+                        let values = osc52.push(&bytes);
+                        if let Some(callback) = self.clipboard_callback.lock().unwrap().clone() {
+                            for value in values {
+                                callback(String::from_utf8_lossy(&value).into_owned());
+                            }
+                        }
+                    }
+                    if let Some(process) = zmodem.as_mut() {
+                        zmodem_last_activity = Some(Instant::now());
+                        let server_finished = zmodem_server_finish_detector.push(&bytes);
+                        let server_cancelled = bytes
+                            .windows(5)
+                            .any(|window| window == b"\x18\x18\x18\x18\x18");
+                        let write_result = process.stdin.as_mut().map_or_else(
+                            || Err(io::Error::other("ZMODEM process stdin closed")),
+                            |stdin| stdin.write_all(&bytes).and_then(|_| stdin.flush()),
+                        );
+                        if server_finished {
+                            zmodem_server_finished = true;
+                        }
+                        if write_result.is_err() || server_cancelled {
+                            process.stdin.take();
+                            let _ = process.child.kill();
+                        } else if zmodem_server_finished
+                            && zmodem_client_finished
+                            && !zmodem_over_and_out_sent
+                        {
+                            if zmodem_upload {
+                                let mut writer = self.server_in.writer();
+                                writer.write_all(features::zmodem::OVER_AND_OUT)?;
+                                writer.flush()?;
+                            } else {
+                                if let Some(stdin) = process.stdin.as_mut() {
+                                    let _ = stdin.write_all(features::zmodem::OVER_AND_OUT);
+                                }
+                                process.stdin.take();
+                            }
+                            zmodem_over_and_out_sent = true;
+                        }
+                        continue;
+                    }
+                    if tmux_input {
+                        for record in tmux.feed(&bytes) {
+                            match record {
+                                features::tmuxcc::TmuxRecord::Visible(output) => {
+                                    let mut writer = self.client_out.writer();
+                                    writer.write_all(&output)?;
+                                    writer.flush()?;
+                                }
+                                features::tmuxcc::TmuxRecord::Output {
+                                    pane_id,
+                                    prefix,
+                                    bytes: pane_bytes,
+                                    raw_line,
+                                } => {
+                                    if self.options.enable_osc52 && !tmux_transfer {
+                                        let values = osc52.push(&pane_bytes);
+                                        if let Some(callback) =
+                                            self.clipboard_callback.lock().unwrap().clone()
+                                        {
+                                            for value in values {
+                                                callback(
+                                                    String::from_utf8_lossy(&value).into_owned(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    if let (Some(input), Some(trigger)) = (
+                                        transfer_input.as_ref(),
+                                        self.current_trigger.lock().unwrap().clone(),
+                                    ) {
+                                        if trigger.tmux_pane_id == pane_id
+                                            && self.transferring.load(Ordering::SeqCst)
+                                        {
+                                            let _ = input.send(pane_bytes);
+                                            continue;
+                                        }
+                                        let mut writer = self.client_out.writer();
+                                        writer.write_all(&raw_line)?;
+                                        writer.flush()?;
+                                        continue;
+                                    }
+                                    let (output, trigger, trailing) = detector.push(&pane_bytes);
+                                    if let Some(mut trigger) = trigger {
+                                        trigger.tmux_pane_id = pane_id;
+                                        trigger.tmux_prefix = prefix.clone();
+                                        *self.current_trigger.lock().unwrap() =
+                                            Some(trigger.clone());
+                                        transfer_input = Some(self.start_transfer(
+                                            trigger,
+                                            sender.clone(),
+                                            tmux.ack.clone(),
+                                        )?);
+                                        if !output.is_empty() {
+                                            let mut writer = self.client_out.writer();
+                                            writer.write_all(
+                                                &features::tmuxcc::encode_tmux_output(
+                                                    &prefix, &output,
+                                                ),
+                                            )?;
+                                            writer.flush()?;
+                                        }
+                                        if !trailing.is_empty() {
+                                            if let Some(input) = transfer_input.as_ref() {
+                                                let _ = input.send(trailing);
+                                            }
+                                        }
+                                    } else if !output.is_empty() {
+                                        let mut writer = self.client_out.writer();
+                                        writer.write_all(&features::tmuxcc::encode_tmux_output(
+                                            &prefix, &output,
+                                        ))?;
+                                        writer.flush()?;
+                                    }
                                 }
                             }
-                        } else {
-                            transfer_input = None;
-                            bytes
                         }
-                    } else {
-                        bytes
-                    };
+                        continue;
+                    }
+
+                    if self.options.enable_zmodem {
+                        let (ordinary, init) = zmodem_detector.push(&bytes);
+                        if let Some((init, protocol)) = init {
+                            if !ordinary.is_empty() {
+                                let mut writer = self.client_out.writer();
+                                writer.write_all(&ordinary)?;
+                                writer.flush()?;
+                            }
+                            let upload = init.upload;
+                            match self.spawn_zmodem_client(init) {
+                                Ok(mut process) => {
+                                    process
+                                        .stdin
+                                        .as_mut()
+                                        .ok_or_else(|| {
+                                            io::Error::other("ZMODEM process stdin unavailable")
+                                        })?
+                                        .write_all(&protocol)?;
+                                    let stdout = process.take_stdout()?;
+                                    let events = sender.clone();
+                                    thread::Builder::new()
+                                        .name("trzsz-filter-zmodem-output".to_string())
+                                        .spawn(move || pump_zmodem_stdout(stdout, events))?;
+                                    zmodem = Some(process);
+                                    zmodem_upload = upload;
+                                    zmodem_server_finished = false;
+                                    zmodem_client_finished = false;
+                                    zmodem_server_finish_detector =
+                                        features::zmodem::ZmodemFinishDetector::default();
+                                    zmodem_client_finish_detector =
+                                        features::zmodem::ZmodemFinishDetector::default();
+                                    zmodem_last_activity = Some(Instant::now());
+                                    zmodem_timed_out = false;
+                                    zmodem_over_and_out_sent = false;
+                                    if let Some(callback) =
+                                        self.state_callback.lock().unwrap().clone()
+                                    {
+                                        callback(true);
+                                    }
+                                }
+                                Err(error) => {
+                                    let mut writer = self.client_out.writer();
+                                    writer.write_all(
+                                        format!("\r\nZMODEM start failed: {error}\r\n").as_bytes(),
+                                    )?;
+                                    writer.write_all(&protocol)?;
+                                    writer.flush()?;
+                                }
+                            }
+                            continue;
+                        }
+                        bytes = ordinary;
+                    }
                     let (output, trigger, trailing) = detector.push(&bytes);
                     if !output.is_empty() {
                         let mut writer = self.client_out.writer();
@@ -697,7 +1069,8 @@ impl TrzszFilter {
                     }
                     if let Some(trigger) = trigger {
                         *self.current_trigger.lock().unwrap() = Some(trigger.clone());
-                        transfer_input = Some(self.start_transfer(trigger, sender.clone())?);
+                        transfer_input =
+                            Some(self.start_transfer(trigger, sender.clone(), tmux.ack.clone())?);
                         if !trailing.is_empty() {
                             if let Some(input) = transfer_input.as_ref() {
                                 let _ = input.send(trailing);
@@ -705,12 +1078,105 @@ impl TrzszFilter {
                         }
                     }
                 }
+                PumpEvent::ZmodemData(bytes) => {
+                    zmodem_last_activity = Some(Instant::now());
+                    if zmodem_client_finish_detector.push(&bytes) {
+                        zmodem_client_finished = true;
+                    }
+                    let mut writer = self.server_in.writer();
+                    writer.write_all(&bytes)?;
+                    writer.flush()?;
+                    if zmodem_client_finished && zmodem_server_finished && !zmodem_over_and_out_sent
+                    {
+                        if zmodem_upload {
+                            writer.write_all(features::zmodem::OVER_AND_OUT)?;
+                            writer.flush()?;
+                        } else {
+                            if let Some(process) = zmodem.as_mut() {
+                                if let Some(stdin) = process.stdin.as_mut() {
+                                    let _ = stdin.write_all(features::zmodem::OVER_AND_OUT);
+                                }
+                                process.stdin.take();
+                            }
+                        }
+                        zmodem_over_and_out_sent = true;
+                    }
+                }
+                PumpEvent::ZmodemDone => {
+                    if let Some(mut process) = zmodem.take() {
+                        process.stdin.take();
+                        let _ = features::zmodem::wait_child(&mut process.child);
+                        if let Some(callback) = self.state_callback.lock().unwrap().clone() {
+                            callback(false);
+                        }
+                    }
+                    zmodem_upload = false;
+                    zmodem_server_finished = false;
+                    zmodem_client_finished = false;
+                    zmodem_server_finish_detector =
+                        features::zmodem::ZmodemFinishDetector::default();
+                    zmodem_client_finish_detector =
+                        features::zmodem::ZmodemFinishDetector::default();
+                    zmodem_last_activity = None;
+                    zmodem_timed_out = false;
+                    zmodem_over_and_out_sent = false;
+                }
                 PumpEvent::ServerEof => {
                     server_eof = true;
+                    if let Some(process) = zmodem.as_mut() {
+                        let _ = process.child.kill();
+                    }
                     if let Some(controller) = self.active_controller.lock().unwrap().as_ref() {
                         controller.stop(false);
                     }
+                    if self.options.enable_osc52 {
+                        osc52.finish();
+                    }
+                    if self.options.enable_zmodem {
+                        let pending = zmodem_detector.finish();
+                        if !pending.is_empty() {
+                            let mut writer = self.client_out.writer();
+                            writer.write_all(&pending)?;
+                            writer.flush()?;
+                        }
+                    }
+                    for record in tmux.finish() {
+                        match record {
+                            features::tmuxcc::TmuxRecord::Visible(output) => {
+                                let mut writer = self.client_out.writer();
+                                writer.write_all(&output)?;
+                                writer.flush()?;
+                            }
+                            features::tmuxcc::TmuxRecord::Output {
+                                pane_id,
+                                bytes,
+                                raw_line,
+                                ..
+                            } => {
+                                let trigger = self.current_trigger.lock().unwrap().clone();
+                                if trigger
+                                    .as_ref()
+                                    .is_some_and(|trigger| trigger.tmux_pane_id == pane_id)
+                                    && self.transferring.load(Ordering::SeqCst)
+                                {
+                                    if let Some(input) = transfer_input.as_ref() {
+                                        let _ = input.send(bytes);
+                                        continue;
+                                    }
+                                }
+                                let mut writer = self.client_out.writer();
+                                writer.write_all(&raw_line)?;
+                                writer.flush()?;
+                            }
+                        }
+                    }
                     let remaining = detector.finish();
+                    if !remaining.is_empty() {
+                        let mut writer = self.client_out.writer();
+                        writer.write_all(&remaining)?;
+                        writer.flush()?;
+                    }
+                    let remaining = trace.finish();
                     if !remaining.is_empty() {
                         let mut writer = self.client_out.writer();
                         writer.write_all(&remaining)?;
@@ -720,16 +1186,19 @@ impl TrzszFilter {
                     if let Some(shutdown) = shutdown {
                         shutdown();
                     }
-                    if client_eof && transfer_input.is_none() {
+                    if client_eof && transfer_input.is_none() && zmodem.is_none() {
                         return Ok(());
                     }
                 }
                 PumpEvent::ServerError(_error) if client_eof => {
                     server_eof = true;
+                    if let Some(process) = zmodem.as_mut() {
+                        let _ = process.child.kill();
+                    }
                     if let Some(controller) = self.active_controller.lock().unwrap().as_ref() {
                         controller.stop(false);
                     }
-                    if transfer_input.is_none() {
+                    if transfer_input.is_none() && zmodem.is_none() {
                         return Ok(());
                     }
                 }
@@ -747,10 +1216,49 @@ impl TrzszFilter {
         }
     }
 
+    fn spawn_zmodem_client(
+        &self,
+        init: features::zmodem::ZmodemInit,
+    ) -> io::Result<features::zmodem::ZmodemProcess> {
+        let commands = self.zmodem_commands.lock().unwrap().clone();
+        if init.upload {
+            let selector = self.upload_selector.lock().unwrap().clone();
+            let default_path = self.default_upload_path.lock().unwrap().clone();
+            let Some(paths) = selector
+                .as_ref()
+                .map(|selector| {
+                    selector(false, default_path).map_err(|error| io::Error::other(error.message))
+                })
+                .transpose()?
+                .flatten()
+            else {
+                return Err(io::Error::other(
+                    "ZMODEM upload cancelled or no upload selector configured",
+                ));
+            };
+            if paths.is_empty() {
+                return Err(io::Error::other("ZMODEM upload has no selected files"));
+            }
+            check_paths_readable(&paths, false).map_err(|error| io::Error::other(error.message))?;
+            features::zmodem::spawn_client(commands.0, true, &paths, None)
+        } else {
+            let selector = self.download_selector.lock().unwrap().clone();
+            let default_path = self.default_download_path.lock().unwrap().clone();
+            let path = choose_download_path(default_path.as_deref(), selector.as_ref())
+                .map_err(|error| io::Error::other(error.message))?
+                .ok_or_else(|| {
+                    io::Error::other("ZMODEM download cancelled or no download selector configured")
+                })?;
+            check_path_writable(&path).map_err(|error| io::Error::other(error.message))?;
+            features::zmodem::spawn_client(commands.1, false, &[], Some(&path))
+        }
+    }
+
     fn start_transfer(
         &self,
         trigger: TrzszTrigger,
         sender: SyncSender<PumpEvent>,
+        tmux_ack: features::tmuxcc::TmuxAck,
     ) -> io::Result<SyncSender<Vec<u8>>> {
         if self
             .transferring
@@ -762,7 +1270,17 @@ impl TrzszFilter {
                 "a transfer is already active",
             ));
         }
-        let transfer = TrzszTransfer::new(Box::new(self.server_in.writer()));
+        let transfer_writer: Box<dyn Write + Send> = if trigger.tmux_pane_id.is_empty() {
+            Box::new(self.server_in.writer())
+        } else {
+            Box::new(features::tmuxcc::TmuxControlWriter::new(
+                self.server_in.writer(),
+                trigger.tmux_pane_id.clone(),
+                tmux_ack,
+            ))
+        };
+        let mut transfer = TrzszTransfer::new(transfer_writer);
+        transfer.set_tmux_integration(!trigger.tmux_pane_id.is_empty());
         let buffer_sender = transfer.buffer.sender();
         *self.active_controller.lock().unwrap() = Some(StopPromptController::new(&transfer));
         let state_callback = self.state_callback.lock().unwrap().clone();
@@ -913,6 +1431,26 @@ fn spawn_reader<R: Read + Send + 'static>(
     Ok(())
 }
 
+fn pump_zmodem_stdout<R: Read + Send + 'static>(mut reader: R, sender: SyncSender<PumpEvent>) {
+    let mut buffer = [0u8; 32 * 1024];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                if sender
+                    .send(PumpEvent::ZmodemData(buffer[..count].to_vec()))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    let _ = sender.send(PumpEvent::ZmodemDone);
+}
+
 fn make_upload_request(
     paths: &[PathBuf],
     result: Option<mpsc::Sender<Result<(), String>>>,
@@ -1003,6 +1541,7 @@ fn download_files(
         columns,
         client_out,
         observer,
+        &trigger.tmux_prefix,
     );
     let mut callback = Some(&mut progress as &mut dyn ProgressCallback);
     let names = transfer.recv_files(&path, &mut callback)?;
@@ -1054,6 +1593,7 @@ fn upload_files(
         columns,
         client_out,
         observer,
+        &trigger.tmux_prefix,
     );
     let mut callback = Some(&mut progress as &mut dyn ProgressCallback);
     let names = transfer.send_files(&files, &mut callback)?;
@@ -1081,6 +1621,7 @@ fn create_progress(
     columns: Arc<std::sync::atomic::AtomicI32>,
     client_out: SharedEndpoint,
     observer: Option<ProgressObserver>,
+    tmux_prefix: &str,
 ) -> FilterProgress {
     let bar = if quiet {
         None
@@ -1090,7 +1631,7 @@ fn create_progress(
             writer,
             columns.load(Ordering::Relaxed),
             tmux_pane_width,
-            "",
+            tmux_prefix,
         ))
     };
     FilterProgress {
@@ -1263,6 +1804,51 @@ mod tests {
     }
 
     #[test]
+    fn osc52_uses_configured_clipboard_callback_and_preserves_terminal_output() {
+        let clipboard = Arc::new(Mutex::new(Vec::new()));
+        let captured = clipboard.clone();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut options = TrzszOptions::default();
+        options.enable_osc52 = true;
+        let filter = TrzszFilter::new(
+            Box::new(Cursor::new(Vec::<u8>::new())),
+            Box::new(SharedWriter(output.clone())),
+            Box::new(std::io::sink()),
+            Box::new(Cursor::new(
+                b"before\x1b]52;c;Y29weSB0ZXh0\x07after".to_vec(),
+            )),
+            options,
+        );
+        filter.set_clipboard_callback(move |text| captured.lock().unwrap().push(text));
+        filter.run().unwrap();
+        assert_eq!(&*clipboard.lock().unwrap(), &["copy text"]);
+        assert_eq!(
+            &*output.lock().unwrap(),
+            b"before\x1b]52;c;Y29weSB0ZXh0\x07after"
+        );
+    }
+
+    #[test]
+    fn bracketed_drag_path_dispatches_upload_without_forwarding_path_text() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("dragged.txt");
+        std::fs::write(&source, b"payload").unwrap();
+        let paste = format!("\x1b[200~'{}'\x1b[201~\r", source.display());
+        let mut options = TrzszOptions::default();
+        options.detect_drag_file = true;
+        let filter = TrzszFilter::new(
+            Box::new(Cursor::new(paste.into_bytes())),
+            Box::new(std::io::sink()),
+            Box::new(SharedWriter(commands.clone())),
+            Box::new(Cursor::new(Vec::<u8>::new())),
+            options,
+        );
+        filter.run().unwrap();
+        assert_eq!(&*commands.lock().unwrap(), b"\x03trz\r");
+    }
+
+    #[test]
     fn upload_request_validates_paths() {
         assert_eq!(
             make_upload_request(&[], None).err().unwrap().message,
@@ -1279,6 +1865,8 @@ mod tests {
         assert!(parse_trigger(b"::TRZSZ:TRANSFER:R:1.2.0:123:-1\n").is_none());
         assert!(trigger.win_server);
         assert_eq!(trigger.tunnel_port, 7000);
+        let relay_trigger = parse_trigger(b"::TRZSZ:TRANSFER:R:1.2.0:123:7000#R\n").unwrap();
+        assert_eq!(relay_trigger.tunnel_port, 7000);
     }
     struct ShutdownReader(mpsc::Receiver<()>);
 
