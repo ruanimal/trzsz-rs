@@ -1,12 +1,12 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const ENABLE: &[u8] = b"<ENABLE_TRZSZ_TRACE_LOG>";
 const DISABLE: &[u8] = b"<DISABLE_TRZSZ_TRACE_LOG>";
-static TRACE_ID: AtomicU64 = AtomicU64::new(0);
+static TRACE_ID: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Default)]
 pub(in crate::filter) struct TraceLogger {
