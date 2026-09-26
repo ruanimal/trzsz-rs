@@ -288,3 +288,95 @@ fn test_full_handshake_and_data_transfer() {
     let _ = child.wait();
     drop(stdout_thread);
 }
+fn rs_trz() -> PathBuf {
+    let mut p = std::env::current_exe().unwrap();
+    p.pop();
+    p.pop();
+    p.push("trz");
+    assert!(p.exists(), "rs trz not found at {}", p.display());
+    p
+}
+
+#[test]
+fn test_rs_trz_cli_does_not_write_progress_to_stderr() {
+    let rs_trz = rs_trz();
+    let destination = tempfile::tempdir().unwrap();
+    let mut child = Command::new(&rs_trz)
+        .arg(destination.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rs trz");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let stdout_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let stdout_capture = stdout_buf.clone();
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            stdout_capture.lock().unwrap().extend_from_slice(&buf[..n]);
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let trigger_pos = loop {
+        if let Some(pos) = find_subslice(&stdout_buf.lock().unwrap(), b"::TRZSZ:TRANSFER:R:") {
+            break pos;
+        }
+        assert!(Instant::now() < deadline, "trz trigger not received");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let (_, mut pos) =
+        read_line_at(&stdout_buf, trigger_pos, Duration::from_secs(1)).expect("trigger line");
+
+    let action = serde_json::json!({
+        "lang": "go",
+        "version": "1.2.0",
+        "confirm": true,
+        "newline": "\n",
+        "protocol": 1,
+        "binary": false,
+        "support_dir": true
+    });
+    writeln!(
+        stdin,
+        "#ACT:{}",
+        trzsz_rs::escape::encode_string(&action.to_string())
+    )
+    .unwrap();
+    let (_, next_pos) = read_line_at(&stdout_buf, pos, Duration::from_secs(3)).expect("CFG line");
+    pos = next_pos;
+
+    writeln!(stdin, "#NUM:1").unwrap();
+    let (num_succ, next_pos) =
+        read_line_at(&stdout_buf, pos, Duration::from_secs(3)).expect("NUM acknowledgement");
+    assert_eq!(parse_typed_line(&num_succ).0, "SUCC");
+    pos = next_pos;
+
+    let name = trzsz_rs::escape::encode_string("progress-test.txt");
+    writeln!(stdin, "#NAME:{}", name).unwrap();
+    let (name_succ, _) =
+        read_line_at(&stdout_buf, pos, Duration::from_secs(3)).expect("NAME acknowledgement");
+    assert_eq!(parse_typed_line(&name_succ).0, "SUCC");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let mut stderr = Vec::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_end(&mut stderr)
+        .unwrap();
+    assert!(
+        stderr.is_empty(),
+        "unexpected CLI progress output: {stderr:?}"
+    );
+    drop(stdin);
+    drop(stdout_thread);
+}

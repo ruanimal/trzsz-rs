@@ -23,12 +23,10 @@ SOFTWARE.
 */
 
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
 
 use crate::args::TrzArgs;
 use crate::comm::{self, TrzszError, check_path_writable, format_saved_files};
 use crate::escape::get_escape_chars;
-use crate::progress::{ProgressCallback, TextProgressBar};
 use crate::transfer::TrzszTransfer;
 use crate::version::TRZSZ_VERSION;
 
@@ -170,29 +168,8 @@ pub fn trz_main(args: &TrzArgs) -> i32 {
     let signal_controller = interrupt_controller;
     ctrlc::set_handler(move || signal_controller.handle_interrupt()).ok();
 
-    let mut progress = if args.base.quiet || args.base.fork {
-        None
-    } else {
-        let writer: Arc<Mutex<dyn Write + Send>> = Arc::new(Mutex::new(io::stderr()));
-        Some(TextProgressBar::new(
-            writer,
-            comm::get_terminal_columns(),
-            tmux_pane_width,
-            "",
-        ))
-    };
-
-    // Run recv files
-    let result = recv_files(
-        &mut transfer,
-        &args,
-        tmux_mode,
-        tmux_pane_width,
-        &mut progress,
-    );
-    if let Some(ref progress) = progress {
-        progress.show_cursor();
-    }
+    // The client filter renders transfer progress; match trzsz-go's CLI behavior.
+    let result = recv_files(&mut transfer, &args, tmux_mode, tmux_pane_width);
 
     match result {
         Ok(_msg) => 0,
@@ -208,7 +185,6 @@ fn recv_files(
     args: &TrzArgs,
     tmux_mode: comm::TmuxMode,
     tmux_pane_width: i32,
-    progress: &mut Option<TextProgressBar>,
 ) -> Result<String, TrzszError> {
     let action = transfer.recv_action()?;
     if !action.confirm {
@@ -270,10 +246,7 @@ fn recv_files(
             .unwrap_or(crate::comm::CompressType::Auto),
     )?;
 
-    let mut callback = progress
-        .as_mut()
-        .map(|bar| bar as &mut dyn ProgressCallback);
-    let local_names = transfer.recv_files(&args.path, &mut callback)?;
+    let local_names = transfer.recv_files(&args.path, &mut None)?;
 
     transfer.recv_exit()?;
     let msg = format_saved_files(&local_names, &args.path);

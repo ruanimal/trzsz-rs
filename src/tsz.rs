@@ -23,11 +23,9 @@ SOFTWARE.
 */
 
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
 
 use crate::args::TszArgs;
 use crate::comm::{self, TrzszError, check_duplicate_names, check_paths_readable};
-use crate::progress::{ProgressCallback, TextProgressBar};
 use crate::transfer::TrzszTransfer;
 use crate::version::TRZSZ_VERSION;
 
@@ -158,30 +156,7 @@ pub fn tsz_main(args: &TszArgs) -> i32 {
     let signal_controller = interrupt_controller;
     ctrlc::set_handler(move || signal_controller.handle_interrupt()).ok();
 
-    let mut progress = if args.base.quiet || args.base.fork {
-        None
-    } else {
-        let writer: Arc<Mutex<dyn Write + Send>> = Arc::new(Mutex::new(io::stderr()));
-        Some(TextProgressBar::new(
-            writer,
-            comm::get_terminal_columns(),
-            tmux_pane_width,
-            "",
-        ))
-    };
-
-    // Run send files
-    let result = send_files(
-        &mut transfer,
-        &files,
-        &args,
-        tmux_mode,
-        tmux_pane_width,
-        &mut progress,
-    );
-    if let Some(ref progress) = progress {
-        progress.show_cursor();
-    }
+    let result = send_files(&mut transfer, &files, &args, tmux_mode, tmux_pane_width);
 
     match result {
         Ok(_msg) => 0,
@@ -198,7 +173,6 @@ fn send_files(
     args: &TszArgs,
     tmux_mode: comm::TmuxMode,
     tmux_pane_width: i32,
-    progress: &mut Option<TextProgressBar>,
 ) -> Result<String, TrzszError> {
     let action = transfer.recv_action()?;
     if !action.confirm {
@@ -244,10 +218,8 @@ fn send_files(
             .unwrap_or(crate::comm::CompressType::Auto),
     )?;
 
-    let mut callback = progress
-        .as_mut()
-        .map(|bar| bar as &mut dyn ProgressCallback);
-    let _remote_names = transfer.send_files(files, &mut callback)?;
+    // The client filter renders transfer progress; match trzsz-go's CLI behavior.
+    let _remote_names = transfer.send_files(files, &mut None)?;
 
     let msg = transfer.recv_exit()?;
     transfer.server_exit(&msg);
