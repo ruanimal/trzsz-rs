@@ -22,7 +22,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-pub const TRZSZ_VERSION: &str = "1.2.0";
+pub const TRZSZ_VERSION: &str = "1.3.0";
 
 /// A parsed trzsz version string like "1.2.3" → (1, 2, 3).
 #[derive(Debug, Clone, PartialEq, Eq)]
