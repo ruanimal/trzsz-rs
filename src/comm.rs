@@ -610,6 +610,30 @@ impl fmt::Display for BufferSize {
 pub trait FileWriter {
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()>;
     fn close(&mut self) -> io::Result<()>;
+    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file writer is not readable",
+        ))
+    }
+    fn seek(&mut self, _pos: io::SeekFrom) -> io::Result<u64> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file writer is not seekable",
+        ))
+    }
+    fn size(&self) -> io::Result<u64> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file writer size is unavailable",
+        ))
+    }
+    fn set_len(&mut self, _size: u64) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file writer cannot be truncated",
+        ))
+    }
 }
 
 pub struct SimpleFileWriter {
@@ -623,6 +647,20 @@ impl FileWriter for SimpleFileWriter {
     fn close(&mut self) -> io::Result<()> {
         // The transfer-owned writer drops immediately after close returns.
         Ok(())
+    }
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        use std::io::Read;
+        self.file.read(buf)
+    }
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        use std::io::Seek;
+        self.file.seek(pos)
+    }
+    fn size(&self) -> io::Result<u64> {
+        self.file.metadata().map(|metadata| metadata.len())
+    }
+    fn set_len(&mut self, size: u64) -> io::Result<()> {
+        self.file.set_len(size)
     }
 }
 

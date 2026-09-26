@@ -40,7 +40,7 @@ use sha2::Digest;
 use crate::buffer::TrzszBuffer;
 use crate::comm::{
     CompressType, FileReader, FileWriter, SimpleFileReader, SimpleFileWriter, SourceFile,
-    TrzszError, err_stopped, get_new_name, write_all,
+    TargetFile, TrzszError, err_stopped, get_new_name, write_all,
 };
 use crate::escape::{self, EscapeTable};
 use crate::progress::ProgressCallback;
@@ -49,8 +49,8 @@ use crate::version::{TRZSZ_VERSION, TrzszVersion};
 pub const K_PROTOCOL_VERSION2: i32 = 2;
 pub const K_PROTOCOL_VERSION3: i32 = 3;
 pub const K_PROTOCOL_VERSION4: i32 = 4;
-// V2 enables the streaming DATA pipeline; V3+ features remain unimplemented.
-pub const K_PROTOCOL_VERSION: i32 = K_PROTOCOL_VERSION2;
+// V3 adds resumable prefix hashes and Go-compatible COMP negotiation.
+pub const K_PROTOCOL_VERSION: i32 = K_PROTOCOL_VERSION3;
 
 pub const K_LAST_CHUNK_TIME_COUNT: usize = 10;
 
@@ -812,6 +812,46 @@ impl TrzszTransfer {
         Ok((Some(reader), remote_name))
     }
 
+    fn send_file_name_v3(
+        &mut self,
+        src_file: &SourceFile,
+        progress: &mut Option<&mut dyn ProgressCallback>,
+    ) -> Result<(Option<Box<dyn FileReader>>, String), TrzszError> {
+        let source = src_file
+            .marshal()
+            .map_err(|e| crate::comm::simple_trzsz_error("Marshal source file failed", e))?;
+        self.send_string("NAME", &source)?;
+        let payload = self.recv_string("SUCC", false, self.get_new_timeout())?;
+        let target: TargetFile = serde_json::from_str(&payload)
+            .map_err(|e| crate::comm::simple_trzsz_error("Invalid target file", e))?;
+        if target.size < 0 {
+            return Err(crate::comm::simple_error("Invalid target file size"));
+        }
+        if src_file.is_dir {
+            return Ok((None, target.name));
+        }
+
+        let file = fs::File::open(&src_file.abs_path).map_err(|e| TrzszError {
+            message: e.to_string(),
+            err_type: String::new(),
+            trace: false,
+        })?;
+        let mut reader = SimpleFileReader {
+            file,
+            file_size: src_file.size,
+        };
+        if target.size > 0 {
+            reader.file_size = crate::v3::send_prefix_hash(
+                self,
+                &mut reader,
+                src_file.size,
+                target.size,
+                progress,
+            )?;
+        }
+        Ok((Some(Box::new(reader)), target.name))
+    }
+
     pub fn send_file_size(&mut self, size: i64) -> Result<(), TrzszError> {
         self.send_integer("SIZE", size)?;
         self.check_integer(size, self.get_new_timeout())?;
@@ -903,7 +943,11 @@ impl TrzszTransfer {
         }
         let mut remote_names = Vec::new();
         for src_file in source_files {
-            let (file_opt, remote_name) = self.send_file_name(src_file)?;
+            let (file_opt, remote_name) = if self.transfer_config.protocol >= K_PROTOCOL_VERSION3 {
+                self.send_file_name_v3(src_file, progress)?
+            } else {
+                self.send_file_name(src_file)?
+            };
             if let Some(p) = progress.as_mut() {
                 p.on_name(src_file.get_file_name());
             }
@@ -946,7 +990,7 @@ impl TrzszTransfer {
                     err_type: String::new(),
                     trace: false,
                 })?;
-            let (f, ln) = self.create_dir_or_file(path, &src_file)?;
+            let (f, ln) = self.create_dir_or_file(path, &src_file, true)?;
             (f, ln)
         } else {
             self.create_file(path, &file_name)?
@@ -956,6 +1000,51 @@ impl TrzszTransfer {
                 let _ = close_file_writer(&mut **file);
             }
             return Err(error);
+        }
+        Ok((file, local_name))
+    }
+
+    fn recv_file_name_v3(
+        &mut self,
+        path: &Path,
+        progress: &mut Option<&mut dyn ProgressCallback>,
+    ) -> Result<(Option<Box<dyn FileWriter>>, String), TrzszError> {
+        let payload = self.recv_string("NAME", false, self.get_new_timeout())?;
+        let source: SourceFile = serde_json::from_str(&payload)
+            .map_err(|e| crate::comm::simple_trzsz_error("Invalid source file", e))?;
+        if source.size < 0 {
+            return Err(crate::comm::simple_error("Invalid source file size"));
+        }
+        let (mut file, local_name) = self.create_dir_or_file(path, &source, false)?;
+        let target_size =
+            match file.as_ref() {
+                Some(writer) => i64::try_from(writer.size().map_err(|e| {
+                    crate::comm::simple_trzsz_error("Get target file size failed", e)
+                })?)
+                .map_err(|e| crate::comm::simple_trzsz_error("Invalid target file size", e))?,
+                None => 0,
+            };
+        let target = TargetFile {
+            name: local_name.clone(),
+            size: target_size,
+        };
+        let target = serde_json::to_string(&target)
+            .map_err(|e| crate::comm::simple_trzsz_error("Marshal target file failed", e))?;
+        if let Err(error) = self.send_string("SUCC", &target) {
+            if let Some(writer) = file.as_mut() {
+                let _ = close_file_writer(&mut **writer);
+            }
+            return Err(error);
+        }
+        if target_size > 0 {
+            if let Some(writer) = file.as_mut() {
+                if let Err(error) =
+                    crate::v3::recv_prefix_hash(self, &mut **writer, source.size, progress)
+                {
+                    let _ = close_file_writer(&mut **writer);
+                    return Err(error);
+                }
+            }
         }
         Ok((file, local_name))
     }
@@ -1042,7 +1131,11 @@ impl TrzszTransfer {
         }
         let mut local_names = Vec::new();
         for _ in 0..num {
-            let (file_opt, local_name) = self.recv_file_name(path)?;
+            let (file_opt, local_name) = if self.transfer_config.protocol >= K_PROTOCOL_VERSION3 {
+                self.recv_file_name_v3(path, progress)?
+            } else {
+                self.recv_file_name(path)?
+            };
             if let Some(p) = progress.as_mut() {
                 p.on_name(&local_name);
             }
@@ -1091,6 +1184,7 @@ impl TrzszTransfer {
         &mut self,
         path: &Path,
         src_file: &SourceFile,
+        truncate: bool,
     ) -> Result<(Option<Box<dyn FileWriter>>, String), TrzszError> {
         if src_file.rel_path.is_empty() {
             return Err(crate::comm::simple_error(
@@ -1141,13 +1235,11 @@ impl TrzszTransfer {
             path.join(&local_name)
         };
 
-        let file =
-            create_file_with_mode(&full_path, src_file.perm.unwrap_or(0) | 0o600).map_err(|e| {
-                TrzszError {
-                    message: format!("Create file [{}] failed: {}", full_path.display(), e),
-                    err_type: String::new(),
-                    trace: false,
-                }
+        let file = create_file_with_mode(&full_path, src_file.perm.unwrap_or(0) | 0o600, truncate)
+            .map_err(|e| TrzszError {
+                message: format!("Create file [{}] failed: {}", full_path.display(), e),
+                err_type: String::new(),
+                trace: false,
             })?;
         self.add_created_files(full_path.to_str().unwrap_or(""));
         Ok((Some(Box::new(SimpleFileWriter { file })), local_name))
@@ -1163,9 +1255,13 @@ impl TrzszTransfer {
     }
 }
 
-fn create_file_with_mode(path: &Path, mode: u32) -> io::Result<fs::File> {
+fn create_file_with_mode(path: &Path, mode: u32, truncate: bool) -> io::Result<fs::File> {
     let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(truncate);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;

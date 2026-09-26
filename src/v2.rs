@@ -29,7 +29,16 @@ pub(crate) fn send_file_data(
         return Err(crate::comm::simple_error("Invalid file size"));
     }
     let rust_peer = is_rust_peer(transfer);
-    let compress = if rust_peer {
+    let compress = if transfer.transfer_config.protocol >= 3 {
+        match v3_fixed_compression(transfer, size) {
+            Some(compress) => compress,
+            None => {
+                let compress = auto_compress(file, size)?;
+                transfer.send_line("COMP", if compress { "true" } else { "false" })?;
+                compress
+            }
+        }
+    } else if rust_peer {
         let compress = match transfer.transfer_config.compress {
             x if x == CompressType::Yes as i32 => true,
             x if x == CompressType::No as i32 => false,
@@ -38,11 +47,9 @@ pub(crate) fn send_file_data(
         transfer.send_line("COMP", if compress { "true" } else { "false" })?;
         compress
     } else {
-        // The Go V2 implementation fixes compression to !binary and does not
-        // send COMP until V3. Keep that wire behavior for Go peers.
+        // Go protocol 2 fixes compression to !binary and does not exchange COMP.
         !transfer.transfer_config.binary
     };
-
     let binary = transfer.transfer_config.binary;
     let table = get_escape_table(transfer)?;
     let digest = if binary {
@@ -106,20 +113,13 @@ pub(crate) fn recv_file_data(
     if size < 0 {
         return Err(crate::comm::simple_error("Invalid file size"));
     }
-    let compress = if is_rust_peer(transfer) {
-        match transfer
-            .recv_check("COMP", false, transfer.get_new_timeout())?
-            .as_str()
-        {
-            "true" => true,
-            "false" => false,
-            other => {
-                return Err(crate::comm::simple_trzsz_error(
-                    "Unknown compress flag",
-                    other,
-                ));
-            }
+    let compress = if transfer.transfer_config.protocol >= 3 {
+        match v3_fixed_compression(transfer, size) {
+            Some(compress) => compress,
+            None => recv_compress_flag(transfer)?,
         }
+    } else if is_rust_peer(transfer) {
+        recv_compress_flag(transfer)?
     } else {
         !transfer.transfer_config.binary
     };
@@ -184,6 +184,29 @@ pub(crate) fn recv_file_data(
     Ok(digest)
 }
 
+fn v3_fixed_compression(transfer: &TrzszTransfer, size: i64) -> Option<bool> {
+    match transfer.transfer_config.compress {
+        x if x == CompressType::Yes as i32 => Some(true),
+        x if x == CompressType::No as i32 => Some(false),
+        _ if size < 512 => Some(false),
+        _ if size < COMPRESSION_SAMPLE_SIZE as i64 => Some(true),
+        _ => None,
+    }
+}
+
+fn recv_compress_flag(transfer: &mut TrzszTransfer) -> Result<bool, TrzszError> {
+    match transfer
+        .recv_check("COMP", false, transfer.get_new_timeout())?
+        .as_str()
+    {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(crate::comm::simple_trzsz_error(
+            "Unknown compress flag",
+            other,
+        )),
+    }
+}
 fn is_rust_peer(transfer: &TrzszTransfer) -> bool {
     transfer.transfer_config.protocol >= 2
         && transfer.transfer_config.lang == "rust"
@@ -800,5 +823,43 @@ mod tests {
                 .message
                 .contains("DATA frame exceeds negotiated limit")
         );
+    }
+
+    #[test]
+    fn v3_auto_compression_thresholds_match_go() {
+        let mut transfer = TrzszTransfer::new(Box::new(io::sink()));
+        transfer.transfer_config.protocol = 3;
+        assert_eq!(v3_fixed_compression(&transfer, 511), Some(false));
+        assert_eq!(v3_fixed_compression(&transfer, 512), Some(true));
+        assert_eq!(v3_fixed_compression(&transfer, 128 * 1024 - 1), Some(true));
+        assert_eq!(v3_fixed_compression(&transfer, 128 * 1024), None);
+
+        transfer.transfer_config.compress = CompressType::Yes as i32;
+        assert_eq!(v3_fixed_compression(&transfer, 1), Some(true));
+        transfer.transfer_config.compress = CompressType::No as i32;
+        assert_eq!(v3_fixed_compression(&transfer, i64::MAX), Some(false));
+    }
+
+    #[test]
+    fn go_v2_compressed_text_does_not_require_comp_line() {
+        let data = b"Go protocol 2 uses zstd for text without COMP";
+        let compressed = zstd::stream::encode_all(&data[..], 0).unwrap();
+        let encoded = BASE64.encode(compressed);
+        let wire = format!("#DATA:{encoded}\n#DATA:\n");
+        let mut transfer = TrzszTransfer::new(Box::new(io::sink()));
+        transfer.transfer_config.protocol = 2;
+        transfer.transfer_config.lang = "go".to_string();
+        transfer.transfer_config.timeout = 2;
+        transfer.peer_lang = "go".to_string();
+        transfer.add_received_data(wire.as_bytes(), false);
+
+        let digest = recv_file_data(
+            &mut transfer,
+            &mut TestFileWriter,
+            data.len() as i64,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(digest, Md5::digest(data).to_vec());
     }
 }

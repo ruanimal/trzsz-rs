@@ -15,14 +15,14 @@ fn build_go_filter(temp: &Path) -> PathBuf {
         go_module.join("go.mod").is_file(),
         "Go reference module missing"
     );
-    let output = temp.join("go-trzsz-v2");
+    let output = temp.join("go-trzsz-v3");
     let status = std::process::Command::new("go")
         .args(["build", "-o"])
         .arg(&output)
         .args(["./cmd/trzsz"])
         .current_dir(go_module)
         .status()
-        .expect("Go toolchain is required for V2 interoperability tests");
+        .expect("Go toolchain is required for V3 interoperability tests");
     assert!(status.success(), "failed to build repository Go filter");
     output
 }
@@ -50,10 +50,10 @@ func fail(err error) {
 }
 
 func main() {
-	if len(os.Args) != 4 {
-		fail(fmt.Errorf("usage: probe upload-file trz-bin destination"))
-	}
-	server := exec.Command(os.Args[2], "-y", "-q", os.Args[3])
+    if len(os.Args) != 5 {
+        fail(fmt.Errorf("usage: probe upload-file trz-bin destination compress"))
+    }
+    server := exec.Command(os.Args[2], "-y", "-q", "-c", os.Args[4], os.Args[3])
 	serverIn, err := server.StdinPipe()
 	if err != nil { fail(err) }
 	serverOut, err := server.StdoutPipe()
@@ -89,7 +89,7 @@ func main() {
         .arg(&source)
         .current_dir(go_module)
         .status()
-        .expect("Go toolchain is required for V2 interoperability tests");
+        .expect("Go toolchain is required for V3 interoperability tests");
     assert!(status.success(), "failed to build Go OneTimeUpload probe");
     output
 }
@@ -154,7 +154,7 @@ fn wait_for_file(
         }
         if Instant::now() >= deadline {
             panic!(
-                "V2 Go interoperability transfer timed out for {}. PTY output:\n{}",
+                "V3 Go interoperability transfer timed out for {}. PTY output:\n{}",
                 path.display(),
                 String::from_utf8_lossy(&output.lock().unwrap())
             );
@@ -183,7 +183,7 @@ fn create_home(root: &Path, key: &str, value: &Path) -> PathBuf {
 }
 
 #[test]
-fn go_filter_downloads_v2_zstd_stream_from_rust_tsz() {
+fn go_filter_downloads_v3_zstd_stream_from_rust_tsz() {
     let temp = tempfile::tempdir().unwrap();
     let go_binary = build_go_filter(temp.path());
     let download = temp.path().join("downloads");
@@ -209,24 +209,87 @@ fn go_filter_downloads_v2_zstd_stream_from_rust_tsz() {
 }
 
 #[test]
-fn go_filter_uploads_v2_zstd_stream_to_rust_trz() {
+fn go_filter_receives_v3_compress_yes_without_comp_line() {
+    let temp = tempfile::tempdir().unwrap();
+    let go_binary = build_go_filter(temp.path());
+    let download = temp.path().join("downloads");
+    std::fs::create_dir_all(&download).unwrap();
+    let home = create_home(temp.path(), "DefaultDownloadPath", &download);
+    let source = temp.path().join("compress-yes.bin");
+    let expected = vec![b'y'; 384 * 1024];
+    std::fs::write(&source, &expected).unwrap();
+
+    let (child, mut writer, output) = start_go_filter(&go_binary, &home, temp.path());
+    thread::sleep(Duration::from_millis(300));
+    let command = format!(
+        "{} -y -q -c yes {}\n",
+        shell_quote(Path::new(env!("CARGO_BIN_EXE_tsz"))),
+        shell_quote(&source)
+    );
+    writer.write_all(command.as_bytes()).unwrap();
+    writer.flush().unwrap();
+
+    wait_for_file(
+        &download.join("compress-yes.bin"),
+        &expected,
+        Duration::from_secs(30),
+        &output,
+    );
+    stop_filter(child, writer);
+}
+#[test]
+fn go_filter_resumes_rust_v3_transfer_after_hash_mismatch() {
+    let temp = tempfile::tempdir().unwrap();
+    let go_binary = build_go_filter(temp.path());
+    let download = temp.path().join("downloads");
+    std::fs::create_dir_all(&download).unwrap();
+    let home = create_home(temp.path(), "DefaultDownloadPath", &download);
+    let source = temp.path().join("resumable-source.bin");
+    let expected = vec![b'r'; 21 * 1024 * 1024 + 17];
+    std::fs::write(&source, &expected).unwrap();
+    let mut existing = expected[..20 * 1024 * 1024].to_vec();
+    existing[10 * 1024 * 1024 + 7] ^= 0xff;
+    std::fs::write(download.join("resumable-source.bin"), existing).unwrap();
+
+    let (child, mut writer, output) = start_go_filter(&go_binary, &home, temp.path());
+    thread::sleep(Duration::from_millis(300));
+    let command = format!(
+        "{} -y -q -c no {}\n",
+        shell_quote(Path::new(env!("CARGO_BIN_EXE_tsz"))),
+        shell_quote(&source)
+    );
+    writer.write_all(command.as_bytes()).unwrap();
+    writer.flush().unwrap();
+
+    let received = download.join("resumable-source.bin");
+    wait_for_file(&received, &expected, Duration::from_secs(120), &output);
+    stop_filter(child, writer);
+}
+#[test]
+fn go_filter_uploads_v3_zstd_stream_to_rust_trz() {
     let temp = tempfile::tempdir().unwrap();
     let go_probe = build_go_upload_probe(temp.path());
-    let upload = temp.path().join("go-source.bin");
-    let destination = temp.path().join("received");
-    std::fs::create_dir_all(&destination).unwrap();
     let expected = vec![b'g'; 384 * 1024];
-    std::fs::write(&upload, &expected).unwrap();
 
-    let status = Command::new(go_probe)
-        .arg(&upload)
-        .arg(env!("CARGO_BIN_EXE_trz"))
-        .arg(&destination)
-        .status()
-        .expect("run Go OneTimeUpload probe");
-    assert!(status.success(), "Go OneTimeUpload probe failed");
-    assert_eq!(
-        std::fs::read(destination.join("go-source.bin")).unwrap(),
-        expected
-    );
+    for compress in ["auto", "no", "yes"] {
+        let name = format!("go-source-{compress}.bin");
+        let upload = temp.path().join(&name);
+        let destination = temp.path().join(format!("received-{compress}"));
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(&upload, &expected).unwrap();
+        std::fs::write(destination.join(&name), &expected[..128 * 1024]).unwrap();
+
+        let status = Command::new(&go_probe)
+            .arg(&upload)
+            .arg(env!("CARGO_BIN_EXE_trz"))
+            .arg(&destination)
+            .arg(compress)
+            .status()
+            .expect("run Go OneTimeUpload probe");
+        assert!(
+            status.success(),
+            "Go OneTimeUpload probe failed for {compress}"
+        );
+        assert_eq!(std::fs::read(destination.join(&name)).unwrap(), expected);
+    }
 }

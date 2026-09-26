@@ -33,4 +33,5 @@ pub mod trz;
 pub mod trzsz;
 pub mod tsz;
 pub(crate) mod v2;
+pub(crate) mod v3;
 pub mod version;

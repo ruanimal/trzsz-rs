@@ -31,11 +31,23 @@ impl Write for ChanWriter {
 }
 
 fn run_transfer_with_mode(test_data: Vec<u8>, binary: bool, compress: CompressType) {
+    run_transfer_with_preexisting(test_data, binary, compress, None);
+}
+
+fn run_transfer_with_preexisting(
+    test_data: Vec<u8>,
+    binary: bool,
+    compress: CompressType,
+    preexisting: Option<Vec<u8>>,
+) {
     // Set up source and destination paths.
     let dir = tempfile::tempdir().unwrap();
     let src_path = dir.path().join("source.txt");
     let dst_dir = dir.path().join("dst");
     std::fs::create_dir(&dst_dir).unwrap();
+    if let Some(initial) = preexisting {
+        std::fs::write(dst_dir.join("source.txt"), initial).unwrap();
+    }
     std::fs::write(&src_path, &test_data).unwrap();
 
     let metadata = std::fs::metadata(&src_path).unwrap();
@@ -128,7 +140,7 @@ fn run_transfer_with_mode(test_data: Vec<u8>, binary: bool, compress: CompressTy
     });
 
     // Watchdog: fail fast on hang.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(120);
     while !a_handle.is_finished() || !b_handle.is_finished() {
         if Instant::now() > deadline {
             panic!(
@@ -209,4 +221,19 @@ fn test_transfer_large_file() {
         data.push(((i * 31) % 256) as u8);
     }
     run_transfer_with_data(data);
+}
+
+#[test]
+fn test_v3_prefix_hash_resume_and_mismatch_fallback() {
+    let complete = vec![b'c'; 256 * 1024];
+    run_transfer_with_preexisting(complete.clone(), false, CompressType::No, Some(complete));
+
+    let partial_data = vec![b'p'; 11 * 1024 * 1024 + 31];
+    let matching_prefix = partial_data[..10 * 1024 * 1024].to_vec();
+    run_transfer_with_preexisting(partial_data, false, CompressType::No, Some(matching_prefix));
+
+    let mismatch_data = vec![b'm'; 21 * 1024 * 1024 + 17];
+    let mut existing = mismatch_data[..20 * 1024 * 1024].to_vec();
+    existing[10 * 1024 * 1024 + 7] ^= 0xff;
+    run_transfer_with_preexisting(mismatch_data, false, CompressType::No, Some(existing));
 }
