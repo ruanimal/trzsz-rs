@@ -7,7 +7,7 @@
 - **Roadmap 第 1 步 / 传输 P0：已完成**（实现见提交 `06ab606`）：修复 Latin-1 转义、收发数据零进展、畸形协议行、`-r`、binary 降级及 `tmux_output_junk`。
 - **剩余传输 P1：已完成**：接收文件/目录按 Go 的 `perm | 0600` / `perm | 0700` 创建；停止删除兼容普通文件和目录；发送/接收句柄在成功、失败路径均 close；逐 DATA chunk 调用进度回调，`trz`/`tsz` 接入 stderr 进度条；Ctrl+C 通过共享 stop 状态唤醒 buffer 等待。
 - **V3+ 暂停/确认菜单与库侧 Filter 已实现**：`trz`/`tsz` CLI 支持暂停/停止；Rust `TrzszFilter` 提供注入式 `run()`、S/R/D、host selectors、主动/一次性上传及 Phase 5 drag、ZMODEM、OSC52 callback、trace、tmux control mode；公开 `TrzszRelay` API 支持 ACT/CFG、双向中继和可选 tunnel。Go 互通与模拟跳板测试见 `tests/filter_interop.rs`、`tests/relay_interop.rs`。自动 CLI/PTY lifecycle 与 `trzsz -r` 接线不在库移植目标范围。
-- V2 流水线、zstd 流编码/解码及 protocol 1 回退已实现；V2 每文件使用有界 DATA 窗口（最多 5 帧在途），文本流使用 Base64，binary 流使用 escape，文件结束后继续执行原 MD5 校验。V3+ 支持 Go 兼容 `#DATA:=` 暂停心跳；V1/V2 不启用暂停。Rust 最高声明 protocol 4。
+- V2 流式 zstd 编码/解码及 protocol 1 回退已实现；V2 出站每文件最多 5 帧在途，帧从 10 KiB 起并按 ACK 用时自适应调整到 `min(CFG.bufsize, 64 MiB)`，文本流使用 Base64、binary 流使用 escape，文件结束后继续执行原 MD5 校验。V2 帧大小调节与 Go 的 ACK 阈值对齐；read/encode/send 的完整并行 pipeline 仍与 Go 不同。V3+ 支持 Go 兼容 `#DATA:=` 暂停心跳；V1/V2 不启用暂停。Rust 最高声明 protocol 4。
 - **V3 HASH 断点续传已实现**：按 10 MiB 累积 MD5 checkpoint 协商，匹配前缀后从末端继续；摘要不匹配时保留最后一个匹配 checkpoint 并重传其后内容。Rust protocol 3 保留 HASH 前的整数 `SIZE` 行；Go V4 的 HASH 使用 NAME 中的源尺寸、不交换此整数行，Rust V4 已对齐。
 - **V4 目录归档已实现**：同一 `path_id` 的目录子项在非覆盖模式下聚合为单个归档 DATA 流；覆盖模式和 protocol 1–3 保持 Go 的非归档行为。
 - **真实 Go V4 双向互通已验证**：`tests/v3_go_interop.rs` 自行构建仓库 `trzsz-go` filter/probe，覆盖压缩选择/HASH 续传、目录归档，以及 Go filter 显式设置 tunnel connector 后的 Rust `tsz -f` 下载和 Go `OneTimeUpload` → Rust `trz -f` 上传。
@@ -113,7 +113,7 @@ Go `handleServerSignal`：SIGINT/SIGTERM → `stopTransferringFiles(false)`（`c
 | 能力 | Go | Rust | 用户可见影响 |
 |---|---|---|---|
 | **V3 COMP 与压缩选择** | V2（`Protocol < 3`）固定 `compress = !binary`，不交换 COMP；V3+ 的 yes/no 从 CFG 选择固定压缩，不发 COMP；auto：size <512 不压缩，512 B ≤ size <128 KiB 固定压缩，size ≥128 KiB 采样并交换 `#COMP:true/false`（`pipeline.go:432-480`、`comm.go:900-948`） | V2 对 Go peer 保持 `!binary`；V3 实现 Go 的 yes/no/auto 阈值、采样和布尔行格式；Rust↔Rust V2 既有 COMP 扩展不变 | V3 的 `-c yes/no/auto` 与 Go 对等；V2 Go peer 的 `-c` 仍不参与协议选择 |
-| **V2 数据流水线** | 并发 read→MD5→encode→send→ack；每 DATA 返回 `SUCC:length/step`，以空 DATA 结束并等待最终 step ACK（`pipeline.go:653-767,849-1076`） | 出站最多 5 帧、每帧≤32 KiB；入站每帧≤`min(2×CFG.bufsize, 64 MiB)`，文本行在缓冲累积时限长，zstd 解码窗口≤128 MiB；校验逐帧 ACK、结束标记、SIZE 与 MD5 | 延迟 ACK 下仍允许多个 DATA 帧在途；待确认帧与协议帧缓冲有界 |
+| **V2 数据流水线** | 并发 read→MD5→encode→send→ack；发送块从 10 KiB 起，按 ACK 用时自适应调整至 `CFG.bufsize`；每 DATA 返回 `SUCC:length/step`，以空 DATA 结束并等待最终 step ACK（`pipeline.go:653-767,849-1076`） | 出站最多 5 帧；帧大小按 Go 的 `<500 ms` 翻倍、`≥2 s` 降档规则自适应，范围为 1 KiB 至 `min(CFG.bufsize, 64 MiB)`；入站每帧≤`min(2×CFG.bufsize, 64 MiB)`，文本行在缓冲累积时限长，zstd 解码窗口≤128 MiB；校验逐帧 ACK、结束标记、SIZE 与 MD5 | 高延迟下增大单帧和在途窗口的有效字节数；Rust 尚未并行化 Go 的 read/encode/send 阶段 |
 | **V1 回退** | protocol 小于 2 使用旧逐块 DATA/单整数 ACK | 收到 protocol 1 CFG 仍使用原 zlib+Base64 / binary 线格式及 stop-and-wait | 老对端不接收 V2 DATA 流，保持旧行为 |
 | **断点续传 HASH** | V3 使用 10 MiB 累积 MD5 checkpoint；V4 仍按同样 checkpoint 匹配，但从 NAME 的源 `size` 取尺寸，不交换整数 `SIZE` 行（`append.go:162-205,255-320`） | **已实现**：protocol 3 保留整数 `SIZE` 行；protocol 4 从 NAME 的 `size` 取源尺寸并省略该行；HASH/SUCC 校验、失配后截断到最后匹配点 | 老 V3 行为不变；Go V4 文件续传与 Go peer 兼容 |
 | **V4 目录归档** | V4 非覆盖模式将同 `path_id` 项打包为单个 NAME/DATA；归档流由每项的 base64(zlib(SourceFile JSON)) 行、后接其文件字节构成（`archive.go:81-94,106-185`）。覆盖模式不归档 | **已实现**：非覆盖 V4 按 `path_id` 聚合；归档 DATA reader/writer 维持 Go 线格式，跨任意 chunk 解码；归档不走 HASH，目标 SIZE 为 0；覆盖模式与 protocol 1–3 不聚合 | 目录树语义不变，减少目录中每个子项单独的 NAME/SIZE/MD5 协商 |

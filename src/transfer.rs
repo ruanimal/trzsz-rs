@@ -1502,7 +1502,7 @@ impl TrzszTransfer {
         Ok((Some(Box::new(SimpleFileWriter { file })), local_name))
     }
 
-    fn set_last_chunk_time(&mut self, chunk_time: Duration) {
+    pub(crate) fn set_last_chunk_time(&mut self, chunk_time: Duration) {
         let idx = self.last_chunk_time_idx.load(Ordering::Relaxed) as usize;
         self.last_chunk_time_arr[idx] = chunk_time;
         self.last_chunk_time_idx.store(

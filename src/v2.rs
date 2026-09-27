@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::read::DecoderReader;
@@ -14,10 +15,12 @@ use crate::progress::ProgressCallback;
 use crate::transfer::TrzszTransfer;
 
 const ACK_WINDOW: usize = 5;
-const MAX_FRAME_SIZE: usize = 32 * 1024;
+const MIN_FRAME_SIZE: usize = 1024;
+const INITIAL_FRAME_SIZE: usize = 10 * 1024;
 const COMPRESSION_SAMPLE_SIZE: usize = 128 * 1024;
 const MAX_ZSTD_WINDOW_LOG: u32 = 27;
 const MAX_V2_WIRE_FRAME_SIZE: usize = 64 * 1024 * 1024;
+const MAX_FRAME_SIZE: usize = MAX_V2_WIRE_FRAME_SIZE;
 
 fn wait_for_resume(transfer: &mut TrzszTransfer) -> Result<(), TrzszError> {
     if transfer.transfer_config.protocol < 3 {
@@ -334,13 +337,41 @@ fn auto_compress(file: &mut dyn FileReader, size: i64) -> Result<bool, TrzszErro
     }
 }
 
+struct PendingFrame {
+    length: usize,
+    sent_at: Instant,
+}
+
+fn next_frame_size(
+    frame_size: usize,
+    max_frame_size: usize,
+    acknowledged_length: usize,
+    elapsed: Duration,
+) -> usize {
+    if acknowledged_length == frame_size
+        && elapsed < Duration::from_millis(500)
+        && frame_size < max_frame_size
+    {
+        frame_size.saturating_mul(2).min(max_frame_size)
+    } else if elapsed >= Duration::from_secs(2)
+        && acknowledged_length <= frame_size
+        && frame_size > MIN_FRAME_SIZE
+    {
+        let seconds = elapsed.as_secs().min(frame_size as u64).max(1) as usize;
+        (frame_size / seconds).max(MIN_FRAME_SIZE)
+    } else {
+        frame_size
+    }
+}
+
 struct FrameWriter<'t, 'p, 'c> {
     transfer: &'t mut TrzszTransfer,
     binary: bool,
     file_size: i64,
     buffer: Vec<u8>,
     frame_size: usize,
-    pending: VecDeque<usize>,
+    max_frame_size: usize,
+    pending: VecDeque<PendingFrame>,
     last_step: i64,
     progress: &'p mut Option<&'c mut dyn ProgressCallback>,
 }
@@ -352,15 +383,18 @@ impl<'t, 'p, 'c> FrameWriter<'t, 'p, 'c> {
         file_size: i64,
         progress: &'p mut Option<&'c mut dyn ProgressCallback>,
     ) -> Self {
-        let frame_size = usize::try_from(transfer.transfer_config.bufsize.max(1024))
-            .unwrap_or(MAX_FRAME_SIZE)
-            .min(MAX_FRAME_SIZE);
+        let max_frame_size =
+            usize::try_from(transfer.transfer_config.bufsize.max(MIN_FRAME_SIZE as i64))
+                .unwrap_or(MAX_FRAME_SIZE)
+                .min(MAX_FRAME_SIZE);
+        let frame_size = INITIAL_FRAME_SIZE.min(max_frame_size);
         FrameWriter {
             transfer,
             binary,
             file_size,
             buffer: Vec::with_capacity(frame_size),
             frame_size,
+            max_frame_size,
             pending: VecDeque::new(),
             last_step: 0,
             progress,
@@ -372,6 +406,7 @@ impl<'t, 'p, 'c> FrameWriter<'t, 'p, 'c> {
             self.recv_chunk_ack()?;
         }
         wait_for_resume(self.transfer)?;
+        let sent_at = Instant::now();
         let newline = self.transfer.transfer_config.newline.clone();
         if self.binary {
             self.transfer
@@ -386,12 +421,15 @@ impl<'t, 'p, 'c> FrameWriter<'t, 'p, 'c> {
             }
             self.transfer.write_all(newline.as_bytes())?;
         }
-        self.pending.push_back(data.len());
+        self.pending.push_back(PendingFrame {
+            length: data.len(),
+            sent_at,
+        });
         Ok(())
     }
 
     fn recv_chunk_ack(&mut self) -> Result<(), TrzszError> {
-        let expected = self.pending.pop_front().ok_or_else(|| {
+        let pending = self.pending.pop_front().ok_or_else(|| {
             crate::comm::simple_error("V2 ACK received without an outstanding DATA frame")
         })?;
         let response = self
@@ -406,13 +444,22 @@ impl<'t, 'p, 'c> FrameWriter<'t, 'p, 'c> {
         let step = step
             .parse::<i64>()
             .map_err(|e| crate::comm::simple_trzsz_error("Invalid V2 DATA ACK step", e))?;
-        if length != expected {
+        if length != pending.length {
             return Err(crate::comm::simple_trzsz_error(
                 "V2 DATA ACK length mismatch",
-                format!("{} <> {}", length, expected),
+                format!("{} <> {}", length, pending.length),
             ));
         }
-        self.update_step(step)
+        self.update_step(step)?;
+        let chunk_time = pending.sent_at.elapsed();
+        self.transfer.set_last_chunk_time(chunk_time);
+        self.frame_size = next_frame_size(
+            self.frame_size,
+            self.max_frame_size,
+            pending.length,
+            chunk_time,
+        );
+        Ok(())
     }
 
     fn update_step(&mut self, step: i64) -> Result<(), TrzszError> {
@@ -462,8 +509,8 @@ impl Write for FrameWriter<'_, '_, '_> {
             offset += count;
             if self.buffer.len() == self.frame_size {
                 let payload = std::mem::take(&mut self.buffer);
-                self.buffer = Vec::with_capacity(self.frame_size);
                 self.send_payload(&payload).map_err(to_io_error)?;
+                self.buffer = Vec::with_capacity(self.frame_size);
             }
         }
         Ok(data.len())
@@ -724,6 +771,38 @@ mod tests {
             .count()
     }
 
+    fn binary_data_frame_lengths(output: &[u8]) -> Vec<usize> {
+        let mut remaining = output;
+        let mut lengths = Vec::new();
+        while let Some(marker) = remaining
+            .windows(b"#DATA:".len())
+            .position(|window| window == b"#DATA:")
+        {
+            remaining = &remaining[marker + b"#DATA:".len()..];
+            let Some(header_end) = remaining.iter().position(|byte| *byte == b'\n') else {
+                break;
+            };
+            let Ok(header) = std::str::from_utf8(&remaining[..header_end]) else {
+                break;
+            };
+            let Ok(length) = header.parse::<usize>() else {
+                break;
+            };
+            let Some(frame_end) = header_end
+                .checked_add(1)
+                .and_then(|start| start.checked_add(length))
+            else {
+                break;
+            };
+            if frame_end > remaining.len() {
+                break;
+            }
+            lengths.push(length);
+            remaining = &remaining[frame_end..];
+        }
+        lengths
+    }
+
     fn wait_for_frames(output: &Arc<Mutex<Vec<u8>>>, expected: usize) {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -744,6 +823,150 @@ mod tests {
         sender
             .send(format!("#SUCC:{}/{}\n", length, step).into_bytes())
             .unwrap();
+    }
+
+    #[test]
+    fn frame_size_adapts_to_ack_time_within_bounds() {
+        let initial_size = 10 * 1024;
+        let maximum_size = 512 * 1024;
+        assert_eq!(
+            next_frame_size(
+                initial_size,
+                maximum_size,
+                initial_size,
+                Duration::from_millis(100),
+            ),
+            20 * 1024
+        );
+        assert_eq!(
+            next_frame_size(
+                256 * 1024,
+                maximum_size,
+                256 * 1024,
+                Duration::from_millis(100),
+            ),
+            maximum_size
+        );
+        assert_eq!(
+            next_frame_size(
+                maximum_size,
+                maximum_size,
+                maximum_size,
+                Duration::from_millis(100),
+            ),
+            maximum_size
+        );
+        assert_eq!(
+            next_frame_size(
+                maximum_size,
+                maximum_size,
+                maximum_size,
+                Duration::from_secs(4),
+            ),
+            128 * 1024
+        );
+        assert_eq!(
+            next_frame_size(
+                MIN_FRAME_SIZE,
+                maximum_size,
+                MIN_FRAME_SIZE,
+                Duration::from_secs(4),
+            ),
+            MIN_FRAME_SIZE
+        );
+        assert_eq!(
+            next_frame_size(
+                initial_size,
+                maximum_size,
+                initial_size - 1,
+                Duration::from_millis(100),
+            ),
+            initial_size
+        );
+    }
+
+    #[test]
+    fn frame_size_starts_small_and_respects_negotiated_limit() {
+        let output = CaptureWriter::default();
+        let mut transfer = TrzszTransfer::new(Box::new(output));
+        transfer.transfer_config.bufsize = 256 * 1024;
+        let mut progress = None;
+        let writer = FrameWriter::new(&mut transfer, false, 0, &mut progress);
+        assert_eq!(writer.frame_size, INITIAL_FRAME_SIZE);
+        assert_eq!(writer.max_frame_size, 256 * 1024);
+
+        let mut transfer = TrzszTransfer::new(Box::new(io::sink()));
+        transfer.transfer_config.bufsize = 10 * 1024 * 1024;
+        let mut progress = None;
+        let writer = FrameWriter::new(&mut transfer, false, 0, &mut progress);
+        assert_eq!(writer.max_frame_size, 10 * 1024 * 1024);
+
+        let mut transfer = TrzszTransfer::new(Box::new(io::sink()));
+        transfer.transfer_config.bufsize = 128 * 1024 * 1024;
+        let mut progress = None;
+        let writer = FrameWriter::new(&mut transfer, false, 0, &mut progress);
+        assert_eq!(writer.max_frame_size, MAX_V2_WIRE_FRAME_SIZE);
+    }
+
+    #[test]
+    fn sender_adapts_frame_size_after_fast_acknowledgements() {
+        let output = CaptureWriter::default();
+        let captured = output.0.clone();
+        let mut transfer = TrzszTransfer::new(Box::new(output));
+        transfer.transfer_config.bufsize = 64 * 1024;
+        transfer.transfer_config.timeout = 2;
+        let input = transfer.buffer.sender();
+        let file_size = 80 * 1024;
+
+        let worker = thread::spawn(move || {
+            let mut progress = None;
+            let mut writer = FrameWriter::new(&mut transfer, true, file_size as i64, &mut progress);
+            writer.write_all(&vec![b'x'; file_size]).unwrap();
+            writer.finish().unwrap();
+        });
+
+        wait_for_frames(&captured, ACK_WINDOW);
+        let lengths = binary_data_frame_lengths(&captured.lock().unwrap());
+        assert_eq!(lengths, vec![INITIAL_FRAME_SIZE; ACK_WINDOW]);
+
+        send_ack(&input, INITIAL_FRAME_SIZE, 0);
+        wait_for_frames(&captured, ACK_WINDOW + 1);
+        send_ack(&input, INITIAL_FRAME_SIZE, 0);
+        wait_for_frames(&captured, ACK_WINDOW + 2);
+        let lengths = binary_data_frame_lengths(&captured.lock().unwrap());
+        assert_eq!(lengths[ACK_WINDOW], INITIAL_FRAME_SIZE);
+        assert_eq!(lengths[ACK_WINDOW + 1], INITIAL_FRAME_SIZE * 2);
+
+        send_ack(&input, INITIAL_FRAME_SIZE, 0);
+        wait_for_frames(&captured, ACK_WINDOW + 3);
+        for length in [
+            INITIAL_FRAME_SIZE,
+            INITIAL_FRAME_SIZE,
+            INITIAL_FRAME_SIZE,
+            INITIAL_FRAME_SIZE * 2,
+            0,
+        ] {
+            send_ack(&input, length, 0);
+        }
+        input
+            .send(format!("#SUCC:{file_size}\n").into_bytes())
+            .unwrap();
+        worker.join().unwrap();
+
+        let lengths = binary_data_frame_lengths(&captured.lock().unwrap());
+        assert_eq!(
+            lengths,
+            vec![
+                INITIAL_FRAME_SIZE,
+                INITIAL_FRAME_SIZE,
+                INITIAL_FRAME_SIZE,
+                INITIAL_FRAME_SIZE,
+                INITIAL_FRAME_SIZE,
+                INITIAL_FRAME_SIZE,
+                INITIAL_FRAME_SIZE * 2,
+                0,
+            ]
+        );
     }
 
     #[test]
