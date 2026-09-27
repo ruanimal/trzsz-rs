@@ -42,6 +42,7 @@ pub struct TrzszBuffer {
     timeout: Option<Instant>,
     new_timeout: Option<Option<Instant>>,
     stopped: Arc<AtomicBool>,
+    waiting_callback: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl TrzszBuffer {
@@ -56,7 +57,15 @@ impl TrzszBuffer {
             timeout: None,
             new_timeout: None,
             stopped: Arc::new(AtomicBool::new(false)),
+            waiting_callback: None,
         }
+    }
+
+    pub fn set_waiting_callback<F>(&mut self, callback: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.waiting_callback = Some(Arc::new(callback));
     }
 
     pub fn stop(&self) {
@@ -102,6 +111,7 @@ impl TrzszBuffer {
         self.next_buf = None;
         self.next_idx = 0;
 
+        let mut notified_waiting = false;
         loop {
             if self.is_stopped() {
                 return Err(err_stopped());
@@ -127,6 +137,12 @@ impl TrzszBuffer {
                     return Ok(buf);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if !notified_waiting {
+                        if let Some(callback) = &self.waiting_callback {
+                            callback();
+                        }
+                        notified_waiting = true;
+                    }
                     if self
                         .timeout
                         .is_some_and(|timeout| Instant::now() >= timeout)
@@ -387,6 +403,32 @@ mod tests {
         assert!(!is_trzsz_letter(b' '));
         assert!(!is_trzsz_letter(b'\n'));
         assert!(!is_trzsz_letter(0x1b));
+    }
+
+    #[test]
+    fn waiting_callback_only_fires_after_the_buffer_is_drained() {
+        let (waiting_sender, waiting_receiver) = mpsc::channel();
+        let mut buffer = TrzszBuffer::new();
+        buffer.set_waiting_callback(move || {
+            waiting_sender
+                .send(())
+                .expect("wait observer remains connected");
+        });
+        let input = buffer.sender();
+        let reader = std::thread::spawn(move || {
+            assert_eq!(buffer.read_line(false, None).unwrap(), b"#ONE:1");
+            assert_eq!(buffer.read_line(false, None).unwrap(), b"#TWO:2");
+        });
+
+        waiting_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        input.send(b"#ONE:1\n".to_vec()).unwrap();
+        waiting_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        input.send(b"#TWO:2\n".to_vec()).unwrap();
+        reader.join().unwrap();
     }
 
     #[test]

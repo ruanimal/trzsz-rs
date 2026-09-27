@@ -335,6 +335,11 @@ impl TrzszTransfer {
         self.stopped.store(true, Ordering::SeqCst);
         self.buffer.stop();
     }
+
+    /// Encode the protocol failure frame used when an embedding host aborts a session.
+    pub fn abort_bytes(reason: &str) -> Vec<u8> {
+        format!("#fail:{}\n", crate::escape::encode_string(reason)).into_bytes()
+    }
     pub(crate) fn pause_handles(&self) -> (Arc<AtomicBool>, Arc<AtomicU32>, Arc<AtomicBool>) {
         (
             self.pausing.clone(),
@@ -634,7 +639,27 @@ impl TrzszTransfer {
         server_version: Option<&TrzszVersion>,
         remote_is_windows: bool,
     ) -> Result<(), TrzszError> {
-        let mut protocol = K_PROTOCOL_VERSION;
+        self.send_action_with_capabilities(
+            confirm,
+            server_version,
+            remote_is_windows,
+            self.tunnel_connected || !self.tmux_integration,
+            true,
+            K_PROTOCOL_VERSION,
+        )
+    }
+
+    /// Send ACT with the capabilities and protocol ceiling selected by an embedding host.
+    pub fn send_action_with_capabilities(
+        &mut self,
+        confirm: bool,
+        server_version: Option<&TrzszVersion>,
+        remote_is_windows: bool,
+        support_binary: bool,
+        support_directory: bool,
+        max_protocol: i32,
+    ) -> Result<(), TrzszError> {
+        let mut protocol = max_protocol.clamp(1, K_PROTOCOL_VERSION);
         if let Some(ver) = server_version {
             let v113 = TrzszVersion {
                 major: 1,
@@ -647,7 +672,12 @@ impl TrzszTransfer {
                 patch: 0,
             };
             if ver.compare(&v113) <= 0 && ver.compare(&v110) >= 0 {
-                protocol = 2;
+                if protocol < K_PROTOCOL_VERSION2 {
+                    return Err(crate::comm::simple_error(
+                        "Remote server requires protocol 2, but the embedding host supports only protocol 1",
+                    ));
+                }
+                protocol = K_PROTOCOL_VERSION2;
             }
         }
         let action = TransferAction {
@@ -656,8 +686,8 @@ impl TrzszTransfer {
             confirm,
             newline: "\n".to_string(),
             protocol,
-            support_binary: self.tunnel_connected || !self.tmux_integration,
-            support_directory: true,
+            support_binary: support_binary || self.tunnel_connected,
+            support_directory,
             tmux_integration: self.tmux_integration,
             ..Default::default()
         };
@@ -1128,13 +1158,17 @@ impl TrzszTransfer {
         &mut self,
         path: &Path,
     ) -> Result<(Option<Box<dyn FileWriter>>, String), TrzszError> {
-        let (file, local_name, _) = self.recv_file_name_with_source_name(path)?;
+        let mut open_file = None;
+        let (file, local_name, _) = self.recv_file_name_with_source_name(path, &mut open_file)?;
         Ok((file, local_name))
     }
 
     fn recv_file_name_with_source_name(
         &mut self,
         path: &Path,
+        open_file: &mut Option<
+            &mut dyn FnMut(&str) -> Result<(Option<Box<dyn FileWriter>>, String), TrzszError>,
+        >,
     ) -> Result<(Option<Box<dyn FileWriter>>, String, String), TrzszError> {
         let file_name = self.recv_string("NAME", false, self.get_new_timeout())?;
         let (mut file, local_name, source_name) = if self.transfer_config.directory {
@@ -1147,6 +1181,12 @@ impl TrzszTransfer {
             let source_name = src_file.get_file_name().to_string();
             let (f, ln) = self.create_dir_or_file(path, &src_file, true)?;
             (f, ln, source_name)
+        } else if let Some(open_file) = open_file.as_mut() {
+            let (file, local_name) = (**open_file)(&file_name)?;
+            let file = file.ok_or_else(|| {
+                crate::comm::simple_error("Host-provided writer factory returned no file writer")
+            })?;
+            (Some(file), local_name, file_name)
         } else {
             let (f, ln) = self.create_file(path, &file_name)?;
             (f, ln, file_name)
@@ -1164,6 +1204,9 @@ impl TrzszTransfer {
         &mut self,
         path: &Path,
         progress: &mut Option<&mut dyn ProgressCallback>,
+        open_file: &mut Option<
+            &mut dyn FnMut(&str) -> Result<(Option<Box<dyn FileWriter>>, String), TrzszError>,
+        >,
     ) -> Result<(Option<Box<dyn FileWriter>>, String, String), TrzszError> {
         let payload = self.recv_string("NAME", false, self.get_new_timeout())?;
         let source: SourceFile = serde_json::from_str(&payload)
@@ -1172,7 +1215,20 @@ impl TrzszTransfer {
             return Err(crate::comm::simple_error("Invalid source file size"));
         }
         let source_name = source.get_file_name().to_string();
-        let (mut file, local_name) = self.create_dir_or_file(path, &source, false)?;
+        let (mut file, local_name) = if let Some(open_file) = open_file.as_mut() {
+            if source.is_dir || source.archive || source.rel_path.len() != 1 {
+                return Err(crate::comm::simple_error(
+                    "Host-provided writers do not support directory transfers",
+                ));
+            }
+            let (file, local_name) = (**open_file)(&source_name)?;
+            let file = file.ok_or_else(|| {
+                crate::comm::simple_error("Host-provided writer factory returned no file writer")
+            })?;
+            (Some(file), local_name)
+        } else {
+            self.create_dir_or_file(path, &source, false)?
+        };
         let target_size =
             match file.as_ref() {
                 Some(writer) => i64::try_from(writer.size().map_err(|e| {
@@ -1282,6 +1338,40 @@ impl TrzszTransfer {
         path: &Path,
         progress: &mut Option<&mut dyn ProgressCallback>,
     ) -> Result<Vec<String>, TrzszError> {
+        self.recv_files_inner(path, progress, &mut None)
+    }
+
+    /// Receive files using a host-provided writer factory instead of creating
+    /// destination files inside the library. Directory transfers require the
+    /// library's filesystem-backed archive writer and are rejected here.
+    pub fn recv_files_with_writer<F>(
+        &mut self,
+        path: &Path,
+        progress: &mut Option<&mut dyn ProgressCallback>,
+        mut open_file: F,
+    ) -> Result<Vec<String>, TrzszError>
+    where
+        F: FnMut(&str) -> Result<(Option<Box<dyn FileWriter>>, String), TrzszError>,
+    {
+        let mut open_file: Option<
+            &mut dyn FnMut(&str) -> Result<(Option<Box<dyn FileWriter>>, String), TrzszError>,
+        > = Some(&mut open_file);
+        self.recv_files_inner(path, progress, &mut open_file)
+    }
+
+    fn recv_files_inner(
+        &mut self,
+        path: &Path,
+        progress: &mut Option<&mut dyn ProgressCallback>,
+        open_file: &mut Option<
+            &mut dyn FnMut(&str) -> Result<(Option<Box<dyn FileWriter>>, String), TrzszError>,
+        >,
+    ) -> Result<Vec<String>, TrzszError> {
+        if self.transfer_config.directory && open_file.is_some() {
+            return Err(crate::comm::simple_error(
+                "Host-provided writers do not support directory transfers",
+            ));
+        }
         let num = self.recv_file_num()?;
         if let Some(p) = progress.as_mut() {
             p.on_num(num);
@@ -1290,9 +1380,9 @@ impl TrzszTransfer {
         for _ in 0..num {
             let (file_opt, local_name, source_name) =
                 if self.transfer_config.protocol >= K_PROTOCOL_VERSION3 {
-                    self.recv_file_name_v3(path, progress)?
+                    self.recv_file_name_v3(path, progress, open_file)?
                 } else {
-                    self.recv_file_name_with_source_name(path)?
+                    self.recv_file_name_with_source_name(path, open_file)?
                 };
             if let Some(p) = progress.as_mut() {
                 p.on_name(&source_name);
@@ -1549,6 +1639,151 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct CapturedFileWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        closed: Arc<AtomicBool>,
+    }
+
+    impl FileWriter for CapturedFileWriter {
+        fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+            self.bytes.lock().unwrap().extend_from_slice(data);
+            Ok(())
+        }
+
+        fn close(&mut self) -> io::Result<()> {
+            self.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn embedded_action_respects_host_transfer_capabilities() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut transfer = TrzszTransfer::new(Box::new(CaptureWriter(bytes.clone())));
+        transfer
+            .send_action_with_capabilities(true, None, false, false, false, 1)
+            .unwrap();
+
+        let bytes = bytes.lock().unwrap();
+        let payload = std::str::from_utf8(&bytes[b"#ACT:".len()..bytes.len() - 1]).unwrap();
+        let action: TransferAction =
+            serde_json::from_slice(&escape::decode_string(payload).unwrap()).unwrap();
+        assert!(action.confirm);
+        assert_eq!(action.protocol, 1);
+        assert!(!action.support_binary);
+        assert!(!action.support_directory);
+    }
+
+    #[test]
+    fn embedded_action_does_not_exceed_host_protocol_limit_for_legacy_peer() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut transfer = TrzszTransfer::new(Box::new(CaptureWriter(bytes.clone())));
+        let legacy_server = TrzszVersion {
+            major: 1,
+            minor: 1,
+            patch: 3,
+        };
+
+        let result = transfer.send_action_with_capabilities(
+            true,
+            Some(&legacy_server),
+            false,
+            false,
+            false,
+            1,
+        );
+
+        assert!(result.is_err());
+        assert!(bytes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn receive_files_rejects_a_missing_host_writer() {
+        let wire = format!(
+            "#NUM:1\n#NAME:{}\n",
+            escape::encode_string("missing-writer.bin")
+        );
+        let mut transfer = TrzszTransfer::new(Box::new(std::io::sink()));
+        transfer.transfer_config.protocol = 1;
+        transfer.add_received_data(wire.as_bytes(), false);
+        let mut progress = None;
+
+        let result =
+            transfer.recv_files_with_writer(Path::new("."), &mut progress, |remote_name| {
+                Ok((None, remote_name.to_string()))
+            });
+
+        let Err(error) = result else {
+            panic!("a host writer factory must provide a writer for regular files");
+        };
+        assert!(
+            error
+                .message
+                .contains("writer factory returned no file writer")
+        );
+    }
+
+    #[test]
+    fn receive_files_uses_the_embedding_hosts_staging_writers() {
+        let source_files = [
+            ("first.bin", b"first payload".as_slice()),
+            ("second.bin", b"second payload".as_slice()),
+        ];
+        let mut wire = b"#NUM:2\n".to_vec();
+        for (name, data) in source_files {
+            let digest = Md5::digest(data);
+            wire.extend_from_slice(
+                format!(
+                    "#NAME:{}\n#SIZE:{}\n#DATA:{}\n#MD5:{}\n",
+                    escape::encode_string(name),
+                    data.len(),
+                    escape::encode_bytes(data),
+                    escape::encode_bytes(&digest),
+                )
+                .as_bytes(),
+            );
+        }
+
+        let mut transfer = TrzszTransfer::new(Box::new(std::io::sink()));
+        transfer.transfer_config.protocol = 1;
+        transfer.add_received_data(&wire, false);
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let mut progress = None;
+        let names = transfer
+            .recv_files_with_writer(Path::new("."), &mut progress, {
+                let captures = captures.clone();
+                move |remote_name| {
+                    let file_bytes = Arc::new(Mutex::new(Vec::new()));
+                    let closed = Arc::new(AtomicBool::new(false));
+                    captures.lock().unwrap().push((
+                        remote_name.to_string(),
+                        file_bytes.clone(),
+                        closed.clone(),
+                    ));
+                    Ok((
+                        Some(Box::new(CapturedFileWriter {
+                            bytes: file_bytes,
+                            closed,
+                        }) as Box<dyn FileWriter>),
+                        format!("staged-{remote_name}"),
+                    ))
+                }
+            })
+            .unwrap();
+
+        assert_eq!(names, vec!["staged-first.bin", "staged-second.bin"]);
+        let captures = captures.lock().unwrap();
+        assert_eq!(captures.len(), source_files.len());
+        for ((remote_name, data), (captured_name, captured_bytes, closed)) in
+            source_files.into_iter().zip(captures.iter())
+        {
+            assert_eq!(captured_name, remote_name);
+            assert_eq!(&*captured_bytes.lock().unwrap(), data);
+            assert!(closed.load(Ordering::SeqCst));
         }
     }
 

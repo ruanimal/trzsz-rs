@@ -241,9 +241,19 @@ fn longest_marker_prefix_suffix(bytes: &[u8]) -> usize {
         .unwrap_or(0)
 }
 
+/// Parse and validate a complete transfer-trigger line.
+pub fn parse_trzsz_trigger(line: &[u8]) -> Option<TrzszTrigger> {
+    parse_trigger(line)
+}
+
 fn parse_trigger(line: &[u8]) -> Option<TrzszTrigger> {
-    let line = line.strip_suffix(b"\n").unwrap_or(line);
-    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let mut line = line;
+    while line
+        .last()
+        .is_some_and(|byte| *byte == b'\r' || *byte == b'\n')
+    {
+        line = &line[..line.len() - 1];
+    }
     let marker_idx = find_subslice(line, TRIGGER_MARKER)?;
     let body = std::str::from_utf8(&line[marker_idx + TRIGGER_MARKER.len()..]).ok()?;
     let parts: Vec<&str> = body.split(':').collect();
@@ -1545,7 +1555,6 @@ fn download_files(
     );
     let mut callback = Some(&mut progress as &mut dyn ProgressCallback);
     let names = transfer.recv_files(&path, &mut callback)?;
-    transfer.recv_exit()?;
     let message = comm::format_saved_files(&names, &path);
     transfer.client_exit(&message)?;
     Ok(message)
@@ -1756,6 +1765,71 @@ mod tests {
     }
 
     #[test]
+    fn download_filter_finishes_without_waiting_for_remote_exit() {
+        use md5::{Digest, Md5};
+
+        let destination =
+            std::env::temp_dir().join(format!("trzsz-rs-filter-download-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&destination);
+        std::fs::create_dir_all(&destination).unwrap();
+        let payload = b"download without server EXIT";
+        let digest = Md5::digest(payload);
+        let config = br#"{"lang":"tsz","quiet":true,"binary":false,"protocol":1,"timeout":1,"bufsize":1024}"#;
+        let mut incoming = Vec::new();
+        incoming.extend_from_slice(
+            format!("#CFG:{}\n", crate::escape::encode_bytes(config)).as_bytes(),
+        );
+        incoming.extend_from_slice(b"#NUM:1\n");
+        incoming.extend_from_slice(
+            format!("#NAME:{}\n", crate::escape::encode_string("received.txt")).as_bytes(),
+        );
+        incoming.extend_from_slice(format!("#SIZE:{}\n", payload.len()).as_bytes());
+        incoming.extend_from_slice(
+            format!("#DATA:{}\n", crate::escape::encode_bytes(payload)).as_bytes(),
+        );
+        incoming.extend_from_slice(
+            format!("#MD5:{}\n", crate::escape::encode_bytes(&digest)).as_bytes(),
+        );
+
+        let protocol_output = Arc::new(Mutex::new(Vec::new()));
+        let mut transfer = TrzszTransfer::new(Box::new(SharedWriter(protocol_output.clone())));
+        transfer.add_received_data(&incoming, false);
+        let trigger = TrzszTrigger {
+            mode: 'S',
+            version: None,
+            unique_id: String::new(),
+            win_server: false,
+            tunnel_port: 0,
+            tmux_prefix: String::new(),
+            tmux_pane_id: String::new(),
+        };
+
+        let result = download_files(
+            &mut transfer,
+            &trigger,
+            Some(&destination),
+            None,
+            SharedEndpoint::new(Box::new(std::io::sink())),
+            None,
+            Arc::new(std::sync::atomic::AtomicI32::new(80)),
+        );
+
+        assert!(result.is_ok(), "download failed: {result:?}");
+        assert_eq!(
+            std::fs::read(destination.join("received.txt")).unwrap(),
+            payload
+        );
+        assert!(
+            protocol_output
+                .lock()
+                .unwrap()
+                .windows(b"#EXIT:".len())
+                .any(|window| { window == b"#EXIT:" })
+        );
+        std::fs::remove_dir_all(destination).unwrap();
+    }
+
+    #[test]
     fn trigger_detection_parses_and_rewrites_complete_marker() {
         let line = b"shell::TRZSZ:TRANSFER:S:1.2.0:1234567890123:0\r\n";
         let (output, trigger) = TrzszFilter::detect_trzsz(line);
@@ -1764,6 +1838,23 @@ mod tests {
         assert_eq!(trigger.mode, 'S');
         assert_eq!(trigger.version, TrzszVersion::parse("1.2.0"));
         assert_eq!(trigger.unique_id, "1234567890123");
+    }
+
+    #[test]
+    fn public_trigger_parser_validates_complete_handshake_lines() {
+        let trigger = parse_trzsz_trigger(b"::TRZSZ:TRANSFER:R:1.2.0:123:7000\r\n")
+            .expect("valid transfer trigger");
+        assert_eq!(trigger.mode, 'R');
+        assert_eq!(trigger.unique_id, "123");
+        assert_eq!(trigger.tunnel_port, 7000);
+        let pty_trigger =
+            parse_trzsz_trigger(b"\x1b[s::TRZSZ:TRANSFER:R:1.1.8:9047218932100:51087\r\r\n")
+                .expect("PTY newline translation may add a second carriage return");
+        assert_eq!(pty_trigger.mode, 'R');
+        assert_eq!(pty_trigger.unique_id, "9047218932100");
+        assert_eq!(pty_trigger.tunnel_port, 51087);
+        assert!(parse_trzsz_trigger(b"::TRZSZ:TRANSFER:X:1.2.0:123\n").is_none());
+        assert!(parse_trzsz_trigger(b"::TRZSZ:TRANSFER:R:bad:123\n").is_none());
     }
 
     #[test]
