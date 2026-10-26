@@ -277,6 +277,16 @@ jobs:
         run: |
           mkdir -p release
           find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release/ \;
+
+      - name: Create all-platform archive
+        run: |
+          cd release
+          BUNDLE="trzsz-${{ github.ref_name }}-all-platform.tar.gz"
+          rm -f "$BUNDLE"
+          tar czf "$BUNDLE" *.tar.gz *.zip
+
+      - name: Generate checksums
+        run: |
           cd release
           sha256sum * > checksums-sha256.txt
 
